@@ -1,0 +1,23 @@
+{
+ "id": "d069a7cbec97",
+ "site": "lcsc",
+ "mode": "category",
+ "config": {
+  "site": "lcsc",
+  "mode": "category",
+  "perCount": 2,
+  "concurrency": 4,
+  "groupParallel": 2,
+  "catalogs": [
+   {
+    "catalogId": 644,
+    "catalogName": "排针"
+   }
+  ],
+  "brands": []
+ },
+ "status": "done",
+ "groups": {
+  "排针": 2
+ }
+}

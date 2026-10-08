@@ -1,0 +1,23 @@
+{
+ "id": "6bdb5012e89c",
+ "site": "hqchip",
+ "mode": "category",
+ "config": {
+  "site": "hqchip",
+  "mode": "category",
+  "perCount": 2,
+  "concurrency": 4,
+  "groupParallel": 2,
+  "catalogs": [
+   {
+    "catalogId": 1548,
+    "catalogName": "线对板连接器"
+   }
+  ],
+  "brands": []
+ },
+ "status": "done",
+ "groups": {
+  "线对板连接器": 2
+ }
+}

@@ -1,0 +1,21 @@
+{
+ "id": "eb26eb089df6",
+ "mode": "category",
+ "config": {
+  "mode": "category",
+  "perCount": 3,
+  "concurrency": 4,
+  "groupParallel": 1,
+  "catalogs": [
+   {
+    "catalogId": 644,
+    "catalogName": "排针"
+   }
+  ],
+  "brands": []
+ },
+ "status": "done",
+ "groups": {
+  "排针": 3
+ }
+}

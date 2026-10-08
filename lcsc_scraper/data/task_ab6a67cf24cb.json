@@ -1,0 +1,21 @@
+{
+ "id": "ab6a67cf24cb",
+ "mode": "category",
+ "config": {
+  "mode": "category",
+  "perCount": 2,
+  "concurrency": 6,
+  "groupParallel": 3,
+  "catalogs": [
+   {
+    "catalogId": 11068,
+    "catalogName": "线对板针座"
+   }
+  ],
+  "brands": []
+ },
+ "status": "done",
+ "groups": {
+  "线对板针座": 2
+ }
+}

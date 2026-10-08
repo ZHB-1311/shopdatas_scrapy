@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>商城商品数据采集 - 立创 / 华秋</title>
+<style>
+  :root {
+    --blue: #1f7ae0; --blue-dark: #1668c7; --bg: #f4f6fa;
+    --card: #ffffff; --text: #1f2d3d; --muted: #8492a6;
+    --green: #21ba66; --red: #e5484d; --border: #e3e8ef;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 16px 60px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  header .logo { width: 40px; height: 40px; border-radius: 10px; background: var(--blue); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 20px; }
+  header h1 { font-size: 22px; }
+  header .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(31,45,61,.05); }
+  .card h2 { font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .num { width: 22px; height: 22px; border-radius: 50%; background: var(--blue); color: #fff; font-size: 13px; display: inline-flex; align-items: center; justify-content: center; }
+
+  .tabs { display: flex; gap: 10px; margin-bottom: 14px; }
+  .tab { padding: 8px 22px; border-radius: 8px; border: 1px solid var(--border); background: #fff; cursor: pointer; font-size: 14px; }
+  .tab.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 13px; color: var(--muted); }
+  .field input[type=number] { width: 120px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+  .cat-groups { display: flex; flex-direction: column; gap: 12px; max-height: 420px; overflow: auto; padding: 4px; }
+  .cat-group { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .cat-group .g-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .cat-group .g-head b { font-size: 14px; }
+  .leaves { display: flex; flex-wrap: wrap; gap: 8px; }
+  .leaf { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; font-size: 13px; cursor: pointer; user-select: none; background: #fff; }
+  .leaf.on { background: #e8f1fd; border-color: var(--blue); color: var(--blue-dark); }
+  .leaf input { display: none; }
+
+  .brand-box { display: flex; gap: 14px; }
+  .brand-list { flex: 1; max-height: 380px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start; }
+  .brand-side { width: 220px; display: flex; flex-direction: column; gap: 8px; }
+  .brand-side input { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
+  .selected-brands { font-size: 12px; color: var(--muted); max-height: 260px; overflow: auto; line-height: 1.8; }
+
+  .btn { padding: 10px 28px; border-radius: 9px; border: none; font-size: 15px; cursor: pointer; font-weight: 600; }
+  .btn.primary { background: var(--blue); color: #fff; }
+  .btn.primary:hover { background: var(--blue-dark); }
+  .btn.primary:disabled { background: #a9c7ea; cursor: not-allowed; }
+  .btn.danger { background: var(--red); color: #fff; }
+  .btn.ghost { background: #fff; border: 1px solid var(--border); color: var(--text); }
+
+  .progress-row { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; font-size: 14px; }
+  .bar { flex: 1; height: 10px; background: #edf1f7; border-radius: 999px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: linear-gradient(90deg, #2f9bff, var(--blue)); border-radius: 999px; transition: width .4s; width: 0; }
+  .stats { display: flex; gap: 22px; margin: 10px 0 14px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .stats b { color: var(--text); font-size: 17px; margin-right: 4px; }
+  .status-chip { padding: 3px 12px; border-radius: 999px; font-size: 12px; }
+  .chip-running { background: #e8f1fd; color: var(--blue-dark); }
+  .chip-done { background: #e6f7ee; color: var(--green); }
+  .chip-error { background: #fdebec; color: var(--red); }
+  .chip-cancelled { background: #fff4e5; color: #c47b10; }
+
+  .log { background: #0d1b2a; color: #c9e3ff; font-family: Consolas, monospace; font-size: 12px; border-radius: 10px; padding: 12px; height: 240px; overflow: auto; line-height: 1.7; white-space: pre-wrap; }
+  .group-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  .group-table th, .group-table td { border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  .group-table th { color: var(--muted); font-weight: 500; background: #fafbfd; }
+  .actions { display: flex; gap: 12px; align-items: center; }
+  .actions a.download { display: inline-block; padding: 10px 24px; background: var(--green); color: #fff; border-radius: 9px; text-decoration: none; font-weight: 600; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid #cfe1f7; border-top-color: var(--blue); border-radius: 50%; animation: sp .8s linear infinite; vertical-align: -2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">立</div>
+    <div>
+      <h1>商城商品数据采集</h1>
+      <div class="sub">立创商城 / 华秋商城 / 云汉芯城 · 按销量采集 · 支持并发 · 导出 Excel</div>
+    </div>
+  </header>
+
+  <!-- 0. 站点选择 -->
+  <div class="card">
+    <h2><span class="num">0</span>选择商城</h2>
+    <div class="tabs" id="siteTabs">
+      <button class="tab active" data-site="lcsc" onclick="switchSite('lcsc')">立创商城</button>
+      <button class="tab" data-site="hqchip" onclick="switchSite('hqchip')">华秋商城</button>
+      <button class="tab" data-site="ickey" onclick="switchSite('ickey')">云汉芯城</button>
+    </div>
+    <div class="hint" id="siteHint"></div>
+  </div>
+
+  <!-- 1. 采集配置 -->
+  <div class="card">
+    <h2><span class="num">1</span>选择采集方式</h2>
+    <div class="tabs">
+      <button class="tab active" id="tabCategory" onclick="switchMode('category')">按类目采集</button>
+      <button class="tab" id="tabBrand" onclick="switchMode('brand')">按品牌采集</button>
+    </div>
+
+    <div id="categoryPanel">
+      <div class="hint" style="margin-bottom:10px">勾选要采集的子类目（默认全选三大类）。每个子类目按 <b>销量</b> 排序取前 N 个商品。</div>
+      <div class="cat-groups" id="catGroups"><div class="empty"><span class="spin"></span> 正在加载类目…</div></div>
+      <div class="row" style="margin-top:12px">
+        <span class="ghost" style="font-size:13px;color:var(--muted)">快捷：</span>
+        <button class="btn ghost" style="padding:6px 14px;font-size:13px" onclick="selectAll(true)">全选</button>
+        <button class="btn ghost" style="padding:6px 14px;font-size:13px" onclick="selectAll(false)">全不选</button>
+        <button class="btn ghost" style="padding:6px 14px;font-size:13px" onclick="presetThree()">恢复默认三大类</button>
+      </div>
+    </div>
+
+    <div id="brandPanel" style="display:none">
+      <div class="hint" style="margin-bottom:10px">品牌范围为「连接器 / 端子 / 按键开关」类目下的品牌。每个品牌按销量取前 N 个商品。</div>
+      <div class="brand-box">
+        <div class="brand-list" id="brandList"><div class="empty"><span class="spin"></span> 正在加载品牌…</div></div>
+        <div class="brand-side">
+          <input id="brandSearch" placeholder="搜索品牌名" oninput="renderBrands()">
+          <button class="btn ghost" style="padding:6px;font-size:13px" onclick="clearBrands()">清空已选</button>
+          <div class="selected-brands" id="selectedBrands"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <div class="field">
+        <label>每个子类/品牌采集条数</label>
+        <input type="number" id="perCount" value="2" min="1" max="1500">
+      </div>
+      <div class="field">
+        <label>单请求并发数</label>
+        <input type="number" id="concurrency" value="6" min="1" max="20">
+      </div>
+      <div class="field">
+        <label>同时进行的子类/品牌数</label>
+        <input type="number" id="groupParallel" value="3" min="1" max="10">
+      </div>
+      <div class="field" style="flex:1">
+        <button class="btn primary" id="startBtn" onclick="startTask()">开始采集</button>
+      </div>
+    </div>
+    <div class="hint">测试建议：条数填 2 快速验证；正式采集填 1500。并发不宜过大，以免触发网站限流。</div>
+  </div>
+
+  <!-- 2. 任务进度 -->
+  <div class="card">
+    <h2><span class="num">2</span>采集进度
+      <span class="status-chip" id="statusChip" style="display:none"></span>
+    </h2>
+    <div id="noTask" class="empty">尚未开始任务。配置好条件后点击「开始采集」。</div>
+    <div id="taskPanel" style="display:none">
+      <div class="stats">
+        <span><b id="stCollected">0</b>已采集</span>
+        <span><b id="stTotal">0</b>目标</span>
+        <span><b id="stErrors">0</b>失败</span>
+        <span id="stCurrent" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      </div>
+      <div class="progress-row">
+        <div class="bar"><i id="mainBar"></i></div>
+        <span id="mainPct" style="width:52px;text-align:right">0%</span>
+      </div>
+      <button class="btn danger" id="stopBtn" style="margin:12px 0" onclick="stopTask()">停止任务</button>
+      <table class="group-table" id="groupTable">
+        <thead><tr><th style="width:40px">#</th><th>子类目 / 品牌</th><th style="width:220px">进度</th><th style="width:110px">状态</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 3. 日志与导出 -->
+  <div class="card">
+    <h2><span class="num">3</span>运行日志与结果导出</h2>
+    <div class="log" id="logBox">等待任务开始…</div>
+    <div class="actions" style="margin-top:14px">
+      <a class="download" id="downloadBtn" style="display:none" onclick="downloadExcel(event)">下载 Excel 结果</a>
+      <span class="hint" id="excelHint"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOP_DEFAULT = [365, 13644, 423]; // 连接器 / 端子 / 按键开关
+let currentSite = 'lcsc';
+let siteInfo = {};           // {id: {name, brandSupported}}
+let mode = 'category';
+let catGroups = [];          // [{catalogId, catalogName, leaves}]
+let leafState = new Set();   // 选中的 leaf catalogId
+let allBrands = [];          // [{brandId, brandName, firstLetter}]
+let selectedBrands = new Map(); // brandId -> name
+let es = null;               // EventSource
+let currentTaskId = null;
+
+async function loadSites() {
+  const r = await fetch('/api/sites');
+  siteInfo = {};
+  (await r.json()).forEach(s => siteInfo[s.id] = s);
+  updateSiteHint();
+}
+
+function updateSiteHint() {
+  const s = siteInfo[currentSite] || {};
+  const el = document.getElementById('siteHint');
+  if (currentSite === 'hqchip') {
+    el.textContent = '华秋商城：连接器 / 开关及按键 / 线缆及配套，按销量排序，仅支持按类目采集。';
+  } else if (currentSite === 'ickey') {
+    el.textContent = '云汉芯城：开关/继电器 + 连接器（48 个子类），综合排序（站点不提供销量排序），仅支持按类目采集。';
+  } else {
+    el.textContent = '立创商城：连接器 / 端子 / 按键开关，按销量排序，支持按类目与按品牌采集。';
+  }
+  // 华秋不支持品牌模式时禁用品牌tab
+  const tabBrand = document.getElementById('tabBrand');
+  if (s.brandSupported === false) {
+    tabBrand.style.opacity = .45;
+    tabBrand.title = '该商城不支持品牌维度采集';
+    if (mode === 'brand') switchMode('category');
+  } else {
+    tabBrand.style.opacity = '';
+    tabBrand.title = '';
+  }
+}
+
+function switchSite(sid) {
+  if (currentSite === sid) return;
+  currentSite = sid;
+  document.querySelectorAll('#siteTabs .tab').forEach(t => t.classList.toggle('active', t.dataset.site === sid));
+  updateSiteHint();
+  leafState.clear();
+  selectedBrands.clear();
+  document.getElementById('catGroups').innerHTML = '<div class="empty"><span class="spin"></span> 正在加载类目…</div>';
+  document.getElementById('brandList').innerHTML = '<div class="empty"><span class="spin"></span> 正在加载品牌…</div>';
+  loadCatalog();
+  loadBrands();
+}
+
+function switchMode(m) {
+  if (m === 'brand' && siteInfo[currentSite] && siteInfo[currentSite].brandSupported === false) {
+    alert('华秋商城不支持品牌维度采集');
+    return;
+  }
+  mode = m;
+  document.getElementById('tabCategory').classList.toggle('active', m === 'category');
+  document.getElementById('tabBrand').classList.toggle('active', m === 'brand');
+  document.getElementById('categoryPanel').style.display = m === 'category' ? '' : 'none';
+  document.getElementById('brandPanel').style.display = m === 'brand' ? '' : 'none';
+}
+
+async function loadCatalog() {
+  const r = await fetch('/api/catalog?site=' + currentSite);
+  const d = await r.json();
+  catGroups = d.groups;
+  renderCatalog();
+  presetThree();
+}
+
+function renderCatalog() {
+  const box = document.getElementById('catGroups');
+  box.innerHTML = catGroups.map(g => `
+    <div class="cat-group">
+      <div class="g-head">
+        <input type="checkbox" id="gchk${g.catalogId}" onchange="toggleGroup(${g.catalogId}, this.checked)" checked>
+        <b>${g.catalogName}</b>
+        <span style="color:var(--muted);font-size:12px">共 ${g.leaves.length} 个子类</span>
+      </div>
+      <div class="leaves">
+        ${g.leaves.map(l => `
+          <label class="leaf" id="leaf${l.catalogId}">
+            <input type="checkbox" value="${l.catalogId}" onchange="toggleLeaf(${l.catalogId}, this.checked)" checked>${l.catalogName}
+          </label>`).join('')}
+      </div>
+    </div>`).join('');
+}
+
+function toggleGroup(gid, on) {
+  const g = catGroups.find(x => x.catalogId === gid);
+  g.leaves.forEach(l => {
+    if (on) leafState.add(l.catalogId); else leafState.delete(l.catalogId);
+    const el = document.getElementById('leaf' + l.catalogId);
+    if (el) { el.classList.toggle('on', on); el.querySelector('input').checked = on; }
+  });
+  document.getElementById('gchk' + gid).checked = on;
+}
+function toggleLeaf(id, on) {
+  if (on) leafState.add(id); else leafState.delete(id);
+  document.getElementById('leaf' + id).classList.toggle('on', on);
+}
+function selectAll(on) {
+  catGroups.forEach(g => g.leaves.forEach(l => toggleLeaf(l.catalogId, on)));
+  document.querySelectorAll('.cat-group input[type=checkbox]').forEach(c => c.checked = on);
+}
+function presetThree() {
+  selectAll(true);
+}
+
+async function loadBrands() {
+  if (siteInfo[currentSite] && siteInfo[currentSite].brandSupported === false) {
+    allBrands = [];
+    renderBrands();
+    return;
+  }
+  const r = await fetch('/api/brands?site=' + currentSite);
+  if (!r.ok) { allBrands = []; renderBrands(); return; }
+  const d = await r.json();
+  allBrands = Object.values(d.brandMap).flat();
+  renderBrands();
+}
+
+function renderBrands() {
+  const kw = document.getElementById('brandSearch').value.trim().toLowerCase();
+  const box = document.getElementById('brandList');
+  const list = allBrands.filter(b => !kw || b.brandName.toLowerCase().includes(kw));
+  box.innerHTML = list.slice(0, 400).map(b => {
+    const on = selectedBrands.has(b.brandId);
+    return `<label class="leaf ${on ? 'on' : ''}" onclick="toggleBrand(${b.brandId}, '${b.brandName.replace(/'/g, "\\'")}', this);return false;">
+      ${b.brandName}${on ? ' ✓' : ''}</label>`;
+  }).join('') + (list.length === 0 ? '<div class="empty">无匹配品牌</div>' : '');
+  renderSelectedBrands();
+}
+function toggleBrand(id, name, el) {
+  if (selectedBrands.has(id)) selectedBrands.delete(id); else selectedBrands.set(id, name);
+  renderBrands();
+}
+function clearBrands() { selectedBrands.clear(); renderBrands(); }
+function renderSelectedBrands() {
+  document.getElementById('selectedBrands').innerHTML =
+    `已选 <b>${selectedBrands.size}</b> 个品牌：<br>` +
+    [...selectedBrands.values()].join('、');
+}
+
+async function startTask() {
+  const perCount = parseInt(document.getElementById('perCount').value) || 2;
+  const concurrency = parseInt(document.getElementById('concurrency').value) || 6;
+  const groupParallel = parseInt(document.getElementById('groupParallel').value) || 3;
+  const body = { site: currentSite, mode, perCount, concurrency, groupParallel, catalogs: [], brands: [] };
+
+  if (mode === 'category') {
+    if (leafState.size === 0) return alert('请至少勾选一个子类目');
+    body.catalogs = [...leafState].map(id => {
+      for (const g of catGroups) {
+        const l = g.leaves.find(x => x.catalogId === id);
+        if (l) return { catalogId: id, catalogName: l.catalogName };
+      }
+      return { catalogId: id, catalogName: String(id) };
+    });
+  } else {
+    if (selectedBrands.size === 0) return alert('请至少选择一个品牌');
+    body.brands = [...selectedBrands.entries()].map(([brandId, brandName]) => ({ brandId, brandName }));
+  }
+
+  const r = await fetch('/api/tasks', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { const t = await r.text(); return alert('创建任务失败: ' + t); }
+  const d = await r.json();
+  currentTaskId = d.id;
+  subscribe(d.id);
+}
+
+function stopTask() {
+  if (currentTaskId) fetch(`/api/tasks/${currentTaskId}/stop`, { method: 'POST' });
+}
+
+function subscribe(taskId) {
+  if (es) es.close();
+  document.getElementById('noTask').style.display = 'none';
+  document.getElementById('taskPanel').style.display = '';
+  document.getElementById('downloadBtn').style.display = 'none';
+  document.getElementById('excelHint').textContent = '';
+  es = new EventSource(`/api/tasks/${taskId}/events`);
+  es.onmessage = e => renderTask(JSON.parse(e.data));
+  es.onerror = async () => {
+    // SSE 断开后拉一次状态
+    const r = await fetch(`/api/tasks/${taskId}`);
+    if (r.ok) renderTask(await r.json());
+  };
+}
+
+function chipClass(status) {
+  return { running: 'chip-running', done: 'chip-done', error: 'chip-error', cancelled: 'chip-cancelled' }[status] || 'chip-running';
+}
+const STATUS_TEXT = { pending: '排队中', running: '采集中', done: '已完成', error: '失败', cancelled: '已停止' };
+
+function renderTask(t) {
+  const chip = document.getElementById('statusChip');
+  chip.style.display = '';
+  chip.className = 'status-chip ' + chipClass(t.status);
+  chip.textContent = STATUS_TEXT[t.status] || t.status;
+
+  document.getElementById('stCollected').textContent = t.collected;
+  document.getElementById('stTotal').textContent = t.totalProducts;
+  document.getElementById('stErrors').textContent = t.errors;
+  document.getElementById('stCurrent').textContent = t.current ? ('正在: ' + t.current) : '';
+  const pct = t.totalProducts ? Math.round(t.collected / t.totalProducts * 100) : 0;
+  document.getElementById('mainBar').style.width = pct + '%';
+  document.getElementById('mainPct').textContent = pct + '%';
+  document.getElementById('stopBtn').style.display = t.status === 'running' ? '' : 'none';
+
+  const groups = Object.entries(t.groups || {});
+  const tbody = document.querySelector('#groupTable tbody');
+  tbody.innerHTML = groups.map(([name, g], i) => {
+    const p = g.target ? Math.round(g.collected / g.target * 100) : 0;
+    return `<tr>
+      <td>${i + 1}</td><td>${name}</td>
+      <td><div class="bar" style="height:8px"><i style="width:${p}%"></i></div></td>
+      <td>${g.collected}/${g.target} ${g.done ? '✅' : ''}</td>
+    </tr>`;
+  }).join('');
+
+  // 日志：只在有新内容时拉取
+  fetch(`/api/tasks/${t.id}`).then(r => r.json()).then(full => {
+    const box = document.getElementById('logBox');
+    if (full.logs && full.logs.length) {
+      box.textContent = full.logs.join('\n');
+      box.scrollTop = box.scrollHeight;
+    }
+  });
+
+  if ((t.status === 'done' || t.status === 'cancelled' || t.status === 'error') && t.collected > 0) {
+    const btn = document.getElementById('downloadBtn');
+    btn.style.display = '';
+    btn.href = `/api/tasks/${t.id}/export`;
+    btn.setAttribute('data-name', t.excelName || '结果.xlsx');
+    document.getElementById('excelHint').textContent =
+      t.status === 'done' ? '采集完成，点击下载 Excel' : '任务未全部完成，可先导出已采集部分';
+  }
+}
+
+function downloadExcel(ev) {
+  ev.preventDefault();
+  const btn = document.getElementById('downloadBtn');
+  const name = btn.getAttribute('data-name') || '结果.xlsx';
+  location.href = `/api/tasks/${currentTaskId}/export`;
+}
+
+loadSites();
+loadCatalog();
+loadBrands();
+</script>
+</body>
+</html>
