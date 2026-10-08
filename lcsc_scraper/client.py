@@ -107,6 +107,59 @@ def solve_challenge_sync(html: str, url: str) -> Optional[str]:
     return None
 
 
+# 另一种 WAF 变体（如品牌页的 `_xvasu`）：页面内联脚本直接 document.cookie=...
+# 这里在 Node 里执行页面的全部内联脚本，捕获其写入的 cookie（含 tws2_* 等）。
+_NODE_JAR_TEMPLATE = """
+let cookieJar = {};
+globalThis.document = { getElementById: () => ({ innerHTML: '' }), referrer: %(ref)s };
+Object.defineProperty(globalThis.document, 'cookie', {
+  get() { return Object.entries(cookieJar).map(([k,v])=>k+'='+v).join('; '); },
+  set(v) { const [kv] = v.split(';'); const i = kv.indexOf('='); if (i > 0) cookieJar[kv.slice(0,i).trim()] = kv.slice(i+1); }
+});
+globalThis.location = { href: %(href)s, reload(){}, assign(){}, replace(){} };
+globalThis.navigator = { userAgent: %(ua)s };
+globalThis.window = globalThis;
+const timer = setInterval(() => {
+  if (Object.keys(cookieJar).length) { console.log(JSON.stringify(cookieJar)); clearInterval(timer); process.exit(0); }
+}, 50);
+setTimeout(() => { console.log(JSON.stringify(cookieJar)); process.exit(0); }, 8000);
+%(evals)s
+"""
+
+
+def solve_scripts_sync(html: str, url: str) -> dict[str, str]:
+    """执行页面内联脚本，返回其写入的 cookie jar（用于 _xvasu 类挑战）。"""
+    scripts = [
+        s for s in re.findall(r"<script[^>]*>(.*?)</script>", html, re.S) if s.strip()
+    ]
+    if not scripts:
+        return {}
+    evals = "; ".join(
+        f"try{{(0,eval)({json.dumps(s)})}}catch(e){{}}" for s in scripts
+    )
+    js = _NODE_JAR_TEMPLATE % {
+        "ref": json.dumps(_ALICHLG_REF),
+        "href": json.dumps(url),
+        "ua": json.dumps(USER_AGENT),
+        "evals": evals,
+    }
+    try:
+        proc = subprocess.run(
+            ["node", "-e", js], capture_output=True, text=True, timeout=25
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        logger.error("反爬挑战求解失败：需要 Node.js 环境（node 命令不可用或超时）")
+        return {}
+    for line in reversed(proc.stdout.strip().splitlines()):
+        try:
+            jar = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(jar, dict):
+            return {k: str(v) for k, v in jar.items()}
+    return {}
+
+
 class LcscError(Exception):
     pass
 
@@ -147,23 +200,31 @@ class LcscClient:
     def _has_fresh_acw(self) -> bool:
         return bool(self._acw_cookie) and (time.time() - self._acw_time) < 3000
 
-    async def _ensure_acw(self, html: str, url: str) -> bool:
+    async def _solve(self, html: str, url: str) -> bool:
         """求解挑战并写入 cookie jar。
 
-        并发下只允许一个协程解挑战：若别的协程在 5 秒内刚解过，
-        直接复用；否则用当前挑战页重新求解。
+        - renderData（acw 变体）：cookie 约 1 小时有效，可复用；并发下只解一次。
+        - 其它（如 `_xvasu` 脚本变体，品牌页）：值随请求变化，每次重新执行脚本取 cookie。
         """
-        async with self._acw_lock:
-            if time.time() - self._acw_time < 5:
-                return self._has_fresh_acw()
-            value = await asyncio.to_thread(solve_challenge_sync, html, url)
-            if not value:
-                return False
-            self._acw_cookie = value
-            self._acw_time = time.time()
-            self._client.cookies.set("acw_sc__v2", value, domain="szlcsc.com")
-            logger.info("反爬挑战已求解，cookie 有效期约1小时")
-            return True
+        if _RENDER_DATA_RE.search(html):
+            async with self._acw_lock:
+                if self._has_fresh_acw():
+                    return True
+                value = await asyncio.to_thread(solve_challenge_sync, html, url)
+                if not value:
+                    return False
+                self._acw_cookie = value
+                self._acw_time = time.time()
+                self._client.cookies.set("acw_sc__v2", value, domain="szlcsc.com")
+                logger.info("反爬挑战已求解（acw），cookie 有效期约1小时")
+                return True
+        jar = await asyncio.to_thread(solve_scripts_sync, html, url)
+        if not jar:
+            return False
+        for name, value in jar.items():
+            self._client.cookies.set(name, value, domain="szlcsc.com")
+        logger.info("反爬挑战已求解（脚本变体），cookie: %s", ",".join(jar))
+        return True
 
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         last_exc: Exception | None = None
@@ -187,7 +248,7 @@ class LcscClient:
             )
             if challenged:
                 # 解挑战：cookie + GET 附加 alichlgref 参数
-                solved = await self._ensure_acw(resp.text, url)
+                solved = await self._solve(resp.text, url)
                 if solved:
                     if method.upper() == "GET" and "alichlgref" not in url:
                         sep = "&" if "?" in url else "?"
@@ -338,3 +399,48 @@ class LcscClient:
             raise LcscError(f"详情页未找到 __NEXT_DATA__: productId={product_id}")
         data = json.loads(m.group(1))
         return data["props"]["pageProps"].get("webData") or {}
+
+    async def substitute_models(self, product_code: str, product_id: str | int = "") -> list[str]:
+        """替代/关联产品型号：POST /substitute/product/list?productCode=xxx。
+
+        返回型号字符串列表（对应详情页「关联(替代产品)型号」）。
+        """
+        if not product_code:
+            return []
+        referer = (
+            f"https://item.szlcsc.com/{product_id}.html"
+            if product_id
+            else "https://item.szlcsc.com/"
+        )
+        resp = await self._request(
+            "POST",
+            "https://list.szlcsc.com/substitute/product/list",
+            params={"productCode": product_code},
+            headers={"Content-Type": "application/json", "Referer": referer},
+        )
+        data = resp.json()
+        all_items = (data.get("result") or {}).get("all") or []
+        models: list[str] = []
+        for x in all_items:
+            vo = x.get("productVO") or x
+            model = vo.get("productModel")
+            if model:
+                models.append(str(model))
+        return models
+
+    # ---------- 品牌详情（厂商官网） ----------
+
+    async def brand_detail(self, brand_id: str | int) -> dict[str, Any]:
+        """品牌详情页的 currentBrand（含 companyWebsite 厂商官网、logoUrl 等）。
+
+        品牌页 `list.szlcsc.com/brand/{id}.html` 带 `_xvasu` 型 WAF，
+        `_request` 会用 Node 执行挑战脚本取 cookie 后重试。
+        """
+        resp = await self._request("GET", f"https://list.szlcsc.com/brand/{brand_id}.html")
+        m = _NEXT_DATA_RE.search(resp.text)
+        if not m:
+            return {}
+        data = json.loads(m.group(1))
+        page_props = (data.get("props") or {}).get("pageProps") or {}
+        search = (page_props.get("brandResult") or {}).get("searchResult") or {}
+        return search.get("currentBrand") or {}

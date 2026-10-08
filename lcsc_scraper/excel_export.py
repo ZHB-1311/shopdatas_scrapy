@@ -14,9 +14,9 @@ from openpyxl.utils import get_column_letter
 from .scraper import DATA_DIR, ScrapeTask
 
 BASE_COLUMNS = [
-    "商品编号", "型号", "品牌", "类目", "商品描述", "封装",
-    "库存", "近期销量", "最小起订", "包装方式", "单价", "价格梯度",
-    "毛重", "图片链接", "详情链接", "简介/备注",
+    "商品编号", "型号", "品牌", "品牌网址", "类目", "商品描述", "封装",
+    "库存", "近期销量", "最小起订", "包装方式", "包装规格", "单价", "价格梯度",
+    "毛重", "图片链接", "数据手册PDF链接", "关联(替代产品)型号", "详情链接", "简介/备注",
 ]
 
 HEADER_FILL = PatternFill("solid", fgColor="1F7AE0")

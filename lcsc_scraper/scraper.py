@@ -80,9 +80,30 @@ class LcscSite:
 
     def __init__(self, concurrency: int = 6):
         self.client = LcscClient(concurrency=concurrency)
+        self._cat_map: Optional[dict] = None  # catalogId -> catalogName（惰性构建）
+        self._brand_web: dict[str, str] = {}  # 品牌ID -> 厂商官网（惰性缓存）
+        self._brand_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self.client.aclose()
+
+    async def _catalog_name(self, catalog_id) -> str:
+        """类目 id -> 名称（用整棵类目树缓存，避免逐商品查父类）。"""
+        if self._cat_map is None:
+            tree = await self.client.catalog_tree()
+            mapping: dict = {}
+
+            def walk(node: dict) -> None:
+                cid = node.get("catalogId")
+                if cid is not None:
+                    mapping[cid] = node.get("catalogName")
+                for son in node.get("sonCatalogList") or []:
+                    walk(son)
+
+            for top in tree.values():
+                walk(top)
+            self._cat_map = mapping
+        return self._cat_map.get(catalog_id, "")
 
     async def catalog_groups(self) -> list[dict]:
         tree = await self.client.catalog_tree()
@@ -127,33 +148,64 @@ class LcscSite:
             for p in prices
             if p.get("productPrice") is not None
         )
-        min_price = min(
-            (p.get("productPrice") for p in prices if p.get("productPrice") is not None),
-            default=None,
-        )
-        return {
+        # 价格：取 startPurchasedNumber 最大那档 = 最大数量档价格（对齐 scrapy01）
+        max_tier = None
+        for p in prices:
+            s = p.get("startPurchasedNumber")
+            if s is None or p.get("productPrice") is None:
+                continue
+            if max_tier is None or s > (max_tier.get("startPurchasedNumber") or -1):
+                max_tier = p
+        max_price = max_tier.get("productPrice") if max_tier else None
+        # 轮播图：仅取第一张；没有就留空，不额外硬抓
+        carousel = [u for u in (vo.get("luceneBreviaryImageUrls") or "").split("<$>") if u]
+        first_img = carousel[0] if carousel else ""
+        # 数据手册 PDF：fileTypeVOList[].detailVOList[].fileUrl
+        pdf_url = ""
+        for ft in vo.get("fileTypeVOList") or []:
+            for d in ft.get("detailVOList") or []:
+                u = d.get("fileUrl") or ""
+                if u.lower().endswith(".pdf"):
+                    pdf_url = "https://atta.szlcsc.com" + u
+                    break
+            if pdf_url:
+                break
+        # 包装规格：productMinEncapsulationNumber + Unit
+        pack = ""
+        if vo.get("productMinEncapsulationNumber") not in (None, ""):
+            pack = f"{vo.get('productMinEncapsulationNumber')}{vo.get('productMinEncapsulationUnit') or ''}"
+        product = {
             "商品编号": vo.get("productCode"),
             "型号": vo.get("productModel"),
             "品牌": vo.get("productGradePlateName"),
+            "品牌网址": "",
             "品牌ID": vo.get("productGradePlateId"),
             "类目": cat_name or vo.get("productType"),
             "商品描述": vo.get("productName"),
             "封装": vo.get("encapsulationModel"),
-            "库存": vo.get("stockNumber"),
+            "库存": record.get("totalStockNumber")
+            if record.get("totalStockNumber") is not None
+            else vo.get("stockNumber"),
             "近期销量": vo.get("recentlySalesCount"),
             "最小起订": vo.get("minBuyNumber"),
-            "包装方式": f"{vo.get('productMinEncapsulationNumber')}{vo.get('productMinEncapsulationUnit') or ''}"
-            if vo.get("productMinEncapsulationUnit")
-            else "",
-            "单价": min_price,
+            "包装方式": "",  # 详情页 productArrange 覆盖
+            "包装规格": pack,
+            "单价": max_price,
             "价格梯度": price_text,
             "毛重": "",
-            "图片链接": vo.get("bigImageUrl") or vo.get("breviaryImageUrl"),
+            "图片链接": first_img,
+            "数据手册PDF链接": pdf_url,
+            "关联(替代产品)型号": "",
             "详情链接": f"https://item.szlcsc.com/{vo.get('productId')}.html"
             if vo.get("productId")
             else "",
             "简介/备注": vo.get("remark"),
         }
+        # 商品参数（列表页 paramLinkedMap），详情页 paramList 会在 enrich 中覆盖/补充
+        for k, v in (record.get("paramLinkedMap") or {}).items():
+            if k and v not in (None, ""):
+                product[f"参数:{k}"] = v
+        return product
 
     async def enrich(self, product: dict) -> dict:
         pid = product.get("_pid")
@@ -161,16 +213,60 @@ class LcscSite:
             return product
         web = await self.client.product_detail(pid)
         record = web.get("productRecord") or {}
-        product["毛重"] = record.get("productWeight")
+        # 商品毛重（带 kg）
+        if record.get("productWeight") is not None:
+            product["毛重"] = f"{record['productWeight']} kg"
+        # 包装方式：详情页 productArrange
+        if record.get("productArrange"):
+            product["包装方式"] = record["productArrange"]
+        # 最少起订量：详情页动态值覆盖列表
+        if record.get("minBuyNumber") is not None:
+            product["最小起订"] = record["minBuyNumber"]
+        # 品牌
         brand = web.get("brandVO") or {}
         if brand.get("brandName"):
             product["品牌"] = brand["brandName"]
             product["品牌ID"] = brand.get("brandId")
+        # 品牌网址（厂商官网）：按 brandId 缓存，每个品牌仅请求一次
+        bid = product.get("品牌ID")
+        if bid not in (None, ""):
+            key = str(bid)
+            if key not in self._brand_web:
+                async with self._brand_lock:
+                    if key not in self._brand_web:
+                        try:
+                            info = await self.client.brand_detail(key)
+                            self._brand_web[key] = info.get("companyWebsite") or ""
+                        except Exception:  # noqa: BLE001
+                            self._brand_web[key] = ""
+            product["品牌网址"] = self._brand_web.get(key, "")
+        # 商品参数：详情页 paramList 覆盖/补充列表页 paramLinkedMap
         for p in web.get("paramList") or []:
             name = p.get("parameterName")
             value = p.get("parameterDetailValue") or p.get("parameterValue")
-            if name:
+            if name and value not in (None, "", "-"):
                 product[f"参数:{name}"] = value
+        # 类目：大类>子类（currentCatalog.parentId 查父类名）
+        cc = web.get("currentCatalog") or {}
+        sub_name = cc.get("catalogName")
+        parent_id = cc.get("parentId")
+        if sub_name and parent_id and parent_id != cc.get("catalogId"):
+            try:
+                parent_name = await self._catalog_name(parent_id)
+            except Exception:  # noqa: BLE001
+                parent_name = ""
+            product["类目"] = f"{parent_name}>{sub_name}" if parent_name else sub_name
+        elif sub_name:
+            product["类目"] = sub_name
+        # 关联(替代产品)型号
+        code = product.get("商品编号") or record.get("productCode")
+        if code:
+            try:
+                models = await self.client.substitute_models(str(code), pid)
+            except Exception:  # noqa: BLE001
+                models = []
+            if models:
+                product["关联(替代产品)型号"] = " | ".join(models)
         return product
 
     async def brands(self) -> dict[str, list[dict]]:
