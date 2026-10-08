@@ -297,14 +297,21 @@ class LcscClient:
     # ---------- 商品列表 ----------
 
     async def category_products_page(
-        self, catalog_id: int, page: int, page_size: int = MAX_PAGE_SIZE
+        self,
+        catalog_id: int,
+        page: int,
+        page_size: int = MAX_PAGE_SIZE,
+        brand_id: int | str | None = None,
     ) -> dict[str, Any]:
-        """类目商品列表（按销量排序），返回 result 字段。"""
+        """类目商品列表（按销量排序），返回 result 字段。
+
+        传 brand_id 时叠加品牌过滤（类目 + 品牌），供品牌模式复用类目采集逻辑。
+        """
         payload = {
             "currentPage": page,
             "pageSize": page_size,
             "catalogIdFilter": catalog_id,
-            "brandIdFilter": "",
+            "brandIdFilter": str(brand_id) if brand_id not in (None, "") else "",
             "standardFilter": "",
             "brandPlaceFilter": "",
             "brandOriginFilter": "",
@@ -428,13 +435,15 @@ class LcscClient:
                 models.append(str(model))
         return models
 
-    # ---------- 品牌详情（厂商官网） ----------
+    # ---------- 品牌页（厂商官网 / 子类目分面） ----------
 
-    async def brand_detail(self, brand_id: str | int) -> dict[str, Any]:
-        """品牌详情页的 currentBrand（含 companyWebsite 厂商官网、logoUrl 等）。
+    async def brand_page_info(self, brand_id: str | int) -> dict[str, Any]:
+        """品牌页 searchResult：含 currentBrand（官网/简介）与 catalogGroup（品牌 × 子类目商品数）。
 
         品牌页 `list.szlcsc.com/brand/{id}.html` 带 `_xvasu` 型 WAF，
         `_request` 会用 Node 执行挑战脚本取 cookie 后重试。
+        catalogGroup 的 count 与「类目 + 品牌」列表接口的 totalCount 一致，
+        用于探测品牌实际出现在哪些子类目、各有多少商品。
         """
         resp = await self._request("GET", f"https://list.szlcsc.com/brand/{brand_id}.html")
         m = _NEXT_DATA_RE.search(resp.text)
@@ -442,5 +451,67 @@ class LcscClient:
             return {}
         data = json.loads(m.group(1))
         page_props = (data.get("props") or {}).get("pageProps") or {}
-        search = (page_props.get("brandResult") or {}).get("searchResult") or {}
-        return search.get("currentBrand") or {}
+        return ((page_props.get("brandResult") or {}).get("searchResult")) or {}
+
+    async def brand_meta(self, brand_id: str | int) -> dict[str, Any]:
+        """品牌元信息 currentBrand（companyWebsite 厂商官网 / companyContext 品牌简介 / logoUrl）。
+
+        走品牌商品列表接口 `GET /brand/product`（pageSize=1）。品牌页
+        `list.szlcsc.com/brand/{id}.html` 已被腾讯验证码拦截（实测任意 brandId 都只返回
+        1697 字节的验证码壳，无 `__NEXT_DATA__`），拿不到 currentBrand；而该接口未被拦截，
+        返回的 `result.searchResult.currentBrand` 与品牌页同源，含官网与简介。
+        """
+        resp = await self._request(
+            "GET",
+            "https://list.szlcsc.com/brand/product",
+            params={
+                "currentPage": 1,
+                "pageSize": 1,
+                "brandIdFilter": brand_id,
+                "sortNumber": SORT_BY_SALES,
+            },
+        )
+        data = resp.json()
+        if data.get("code") != 200:
+            return {}
+        result = data.get("result") or {}
+        return ((result.get("searchResult") or {}).get("currentBrand")) or {}
+
+    async def brand_detail(self, brand_id: str | int) -> dict[str, Any]:
+        """品牌详情 currentBrand（companyWebsite 厂商官网、companyContext 简介等）。
+
+        品牌页路线，当前被验证码拦截、通常返回空；需要官网/简介请用 `brand_meta`。
+        """
+        info = await self.brand_page_info(brand_id)
+        return info.get("currentBrand") or {}
+
+    # ---------- 引脚图 / 焊盘图（立创 EDA，当前采集流程已不调用） ----------
+
+    async def pinpad_urls(self, product_code: str | int) -> tuple[str, str]:
+        """按商品编号取引脚图(docType=2)/焊盘图(docType=4)URL，返回 (pin, pad)。
+
+        注意：`LcscSite.enrich()` 已不再调用——导出不要这两列，且每个商品会多打一次
+        lceda.cn 请求。如需这两列，在 enrich 里重新接上即可。
+        """
+        code = str(product_code)
+        if not code:
+            return "", ""
+        resp = await self._request(
+            "GET",
+            f"https://lceda.cn/api/products/{urllib.parse.quote(code)}/svgs",
+            headers={"Referer": "https://lceda.cn/"},
+        )
+        data = resp.json()
+        pin = pad = ""
+        for it in data.get("result") or []:
+            png = it.get("png")
+            if not png:
+                continue
+            url = png if str(png).startswith("http") else "https:" + str(png)
+            if it.get("docType") == 2 and not pin:
+                pin = url
+            elif it.get("docType") == 4 and not pad:
+                pad = url
+            if pin and pad:
+                break
+        return pin, pad

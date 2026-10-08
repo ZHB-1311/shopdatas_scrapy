@@ -71,6 +71,37 @@
   .actions { display: flex; gap: 12px; align-items: center; }
   .actions a.download { display: inline-block; padding: 10px 24px; background: var(--green); color: #fff; border-radius: 9px; text-decoration: none; font-weight: 600; }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .cat-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; max-height: 132px; overflow: auto; }
+  .cat-chip { font-size: 12px; background: #eef4fd; color: var(--blue-dark); border: 1px solid #d8e6fa; border-radius: 999px; padding: 3px 12px; white-space: nowrap; cursor: pointer; user-select: none; }
+  .cat-chip b { color: var(--red); margin-left: 5px; }
+  .cat-chip:hover { border-color: var(--blue); }
+  .cat-chip.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .cat-chip.active b { color: #fff; }
+  .prod-filter { margin-left: auto; font-size: 13px; color: var(--muted); font-weight: 400; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  .prod-grid { display: flex; flex-direction: column; gap: 18px; max-height: 560px; overflow: auto; padding: 2px; }
+  .prod-group-head { font-size: 13px; font-weight: 600; margin-bottom: 8px; padding-left: 8px; border-left: 3px solid var(--blue); }
+  .prod-group-head .pi-k { font-weight: 400; }
+  .load-more { display: flex; justify-content: center; padding: 6px 0 2px; }
+  .prod-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+
+  /* 状态列：主状态与「跳过」分行对齐，避免换行错乱 */
+  .st-cell { display: flex; flex-direction: column; gap: 2px; line-height: 1.5; }
+  .st-main { white-space: nowrap; }
+  .st-skip { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .st-all { color: #c47b10; white-space: nowrap; }
+  .prod-item { border: 1px solid var(--border); border-radius: 10px; padding: 10px; display: flex; gap: 10px; background: #fff; }
+  .prod-item img { width: 64px; height: 64px; object-fit: contain; border-radius: 8px; background: #f7f9fc; border: 1px solid var(--border); flex: none; }
+  .prod-item .pi-ph { width: 64px; height: 64px; border-radius: 8px; background: #f0f4f9; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; flex: none; }
+  .prod-item .pi-body { min-width: 0; flex: 1; font-size: 12px; line-height: 1.65; color: #475569; }
+  .prod-item .pi-model { font-weight: 600; font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .prod-item .pi-model a { color: inherit; text-decoration: none; }
+  .prod-item .pi-model a:hover { color: var(--blue); }
+  .prod-item .pi-price { color: var(--red); font-weight: 600; }
+  .prod-item .pi-k { color: var(--muted); }
+  details.db-box { margin-top: 12px; }
+  details.db-box summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+  details.db-box .db-fields { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+  details.db-box .db-fields .field input { width: 150px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
   .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid #cfe1f7; border-top-color: var(--blue); border-radius: 50%; animation: sp .8s linear infinite; vertical-align: -2px; }
   @keyframes sp { to { transform: rotate(360deg); } }
 </style>
@@ -116,7 +147,7 @@
     </div>
 
     <div id="brandPanel" style="display:none">
-      <div class="hint" style="margin-bottom:10px">品牌范围为「连接器 / 端子 / 按键开关」类目下的品牌。每个品牌按销量取前 N 个商品。</div>
+      <div class="hint" style="margin-bottom:10px">品牌范围为「连接器 / 端子 / 按键开关」类目下的品牌。每个品牌在其每个子类目下按 <b>销量</b> 取前 N 个商品，同子类目跨品牌合并、按商品去重。<br>开始后先探测每个品牌在各子类目下的在售商品数，<b>只采集有商品的「品牌 × 子类目」组合</b>，进度目标即真实待采条数。</div>
       <div class="brand-box">
         <div class="brand-list" id="brandList"><div class="empty"><span class="spin"></span> 正在加载品牌…</div></div>
         <div class="brand-side">
@@ -140,11 +171,44 @@
         <label>同时进行的子类/品牌数</label>
         <input type="number" id="groupParallel" value="3" min="1" max="10">
       </div>
+      <div class="field">
+        <label>图片过滤</label>
+        <select id="imageFilter">
+          <option value="placeholder" selected>跳过非商品图（证书图/占位图）</option>
+          <option value="require">只保留有商品实拍图</option>
+          <option value="off">不过滤</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>数据手册过滤</label>
+        <label style="font-weight:400;margin-top:6px"><input type="checkbox" id="datasheetFilter" checked> 跳过无数据手册的商品</label>
+      </div>
       <div class="field" style="flex:1">
         <button class="btn primary" id="startBtn" onclick="startTask()">开始采集</button>
       </div>
     </div>
-    <div class="hint">测试建议：条数填 2 快速验证；正式采集填 1500。并发不宜过大，以免触发网站限流。</div>
+    <div class="hint">测试建议：条数填 2 快速验证；正式采集填 1500。并发不宜过大，以免触发网站限流。<br>
+      <b>图片过滤</b>：立创部分商品的「图片」是品牌证书图（同一品牌下所有商品共用一张，缩略图完全相同）、云汉可能是默认占位图，这些不是商品实拍图，默认跳过（约占实测数据的 11%）。选「只保留有商品实拍图」会连同<b>无图</b>商品一起跳过（无图约占 44%）。<br>
+      <b>数据手册过滤</b>：跳过没有数据手册 PDF 链接的商品，<b>仅对立创生效</b>（华秋 / 云汉 没有该字段，勾了也不会让它们被清空）。</div>
+
+    <details class="db-box">
+      <summary>数据库去重设置（可选）：跳过 nshop_tp8_v2.sp_goods 中已存在的商品</summary>
+      <div class="db-fields">
+        <div class="field"><label>主机</label><input id="dbHost" placeholder="127.0.0.1"></div>
+        <div class="field"><label>端口</label><input id="dbPort" placeholder="3306"></div>
+        <div class="field"><label>用户名</label><input id="dbUser" placeholder="root"></div>
+        <div class="field"><label>密码</label><input id="dbPassword" type="password" placeholder="留空则不覆盖"></div>
+        <div class="field"><label>数据库</label><input id="dbName" placeholder="nshop_tp8_v2"></div>
+        <div class="field"><label>数据表</label><input id="dbTable" placeholder="sp_goods"></div>
+        <div class="field"><label>商品编号字段</label><input id="dbCodeColumn" placeholder="rsku_hidden"></div>
+        <div class="field"><label>型号字段</label><input id="dbSkuColumn" placeholder="sku"></div>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        留空则读取 <code>lcsc_scraper/db_config.json</code>（或环境变量 DB_HOST 等）；两者都没有时自动跳过该过滤，不影响采集。<br>
+        采集到的「商品编号」命中<b>商品编号字段</b>，或「型号」命中<b>型号字段</b>（忽略大小写与空格）即视为已存在、直接跳过。（在 <code>db_config.json</code> 里把字段名写成空串 <code>""</code> 可关闭对应规则。）
+        <label style="margin-left:8px"><input type="checkbox" id="skipExisting" checked> 启用「跳过已有商品」</label>
+      </div>
+    </details>
   </div>
 
   <!-- 2. 任务进度 -->
@@ -158,6 +222,9 @@
         <span><b id="stCollected">0</b>已采集</span>
         <span><b id="stTotal">0</b>目标</span>
         <span><b id="stErrors">0</b>失败</span>
+        <span><b id="stSkipped">0</b>跳过(已有)</span>
+        <span><b id="stSkippedImg">0</b>跳过(图片)</span>
+        <span><b id="stSkippedDs">0</b>跳过(无手册)</span>
         <span id="stCurrent" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
       </div>
       <div class="progress-row">
@@ -166,7 +233,7 @@
       </div>
       <button class="btn danger" id="stopBtn" style="margin:12px 0" onclick="stopTask()">停止任务</button>
       <table class="group-table" id="groupTable">
-        <thead><tr><th style="width:40px">#</th><th>子类目 / 品牌</th><th style="width:220px">进度</th><th style="width:110px">状态</th></tr></thead>
+        <thead><tr><th style="width:40px">#</th><th>子类目 / 品牌</th><th style="width:220px">进度</th><th style="width:160px">状态</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -179,6 +246,20 @@
     <div class="actions" style="margin-top:14px">
       <a class="download" id="downloadBtn" style="display:none" onclick="downloadExcel(event)">下载 Excel 结果</a>
       <span class="hint" id="excelHint"></span>
+    </div>
+  </div>
+
+  <!-- 4. 商品数据展示 -->
+  <div class="card">
+    <h2><span class="num">4</span>商品数据预览
+      <span class="hint" id="prodCount" style="font-weight:400;margin-left:8px"></span>
+      <label class="prod-filter"><input type="checkbox" id="onlyWithImg" onchange="onImgFilterChange()"> 只看有图</label>
+    </h2>
+    <div class="hint" style="margin-bottom:10px">仅展示通过「采集去重 + 数据库去重（已跳过 sp_goods 已有商品）+ 图片过滤 + 数据手册过滤」的商品，并按类目汇总条数；点击下方胶囊可按类目筛选。</div>
+    <div id="prodEmpty" class="empty">选择条件并开始采集后，这里展示去重后的商品数据。</div>
+    <div id="prodPanel" style="display:none">
+      <div class="cat-chips" id="prodSummary"></div>
+      <div class="prod-grid" id="prodGrid"></div>
     </div>
   </div>
 </div>
@@ -336,6 +417,20 @@ async function startTask() {
   const concurrency = parseInt(document.getElementById('concurrency').value) || 6;
   const groupParallel = parseInt(document.getElementById('groupParallel').value) || 3;
   const body = { site: currentSite, mode, perCount, concurrency, groupParallel, catalogs: [], brands: [] };
+  body.imageFilter = document.getElementById('imageFilter').value;
+  body.datasheetFilter = document.getElementById('datasheetFilter').checked;
+
+  // 数据库去重：仅提交非空字段（覆盖 db_config.json / 环境变量）
+  body.skipExisting = document.getElementById('skipExisting').checked;
+  const db = {};
+  const dbMap = { host: 'dbHost', port: 'dbPort', user: 'dbUser', password: 'dbPassword',
+                  database: 'dbName', table: 'dbTable', codeColumn: 'dbCodeColumn',
+                  skuColumn: 'dbSkuColumn' };
+  for (const [k, id] of Object.entries(dbMap)) {
+    const v = document.getElementById(id).value.trim();
+    if (v) db[k] = v;
+  }
+  body.db = db;
 
   if (mode === 'category') {
     if (leafState.size === 0) return alert('请至少勾选一个子类目');
@@ -371,6 +466,7 @@ function subscribe(taskId) {
   document.getElementById('taskPanel').style.display = '';
   document.getElementById('downloadBtn').style.display = 'none';
   document.getElementById('excelHint').textContent = '';
+  resetProducts();
   es = new EventSource(`/api/tasks/${taskId}/events`);
   es.onmessage = e => renderTask(JSON.parse(e.data));
   es.onerror = async () => {
@@ -394,8 +490,16 @@ function renderTask(t) {
   document.getElementById('stCollected').textContent = t.collected;
   document.getElementById('stTotal').textContent = t.totalProducts;
   document.getElementById('stErrors').textContent = t.errors;
+  document.getElementById('stSkipped').textContent = t.skippedExisting || 0;
+  document.getElementById('stSkippedImg').textContent = t.skippedNoImage || 0;
+  document.getElementById('stSkippedDs').textContent = t.skippedNoDatasheet || 0;
   document.getElementById('stCurrent').textContent = t.current ? ('正在: ' + t.current) : '';
-  const pct = t.totalProducts ? Math.round(t.collected / t.totalProducts * 100) : 0;
+  // 进度按「已处理条数」计：已采集 + 被跳过（数据库已有 / 图片不合规）；跳过也是一条处理完的商品，
+  // 分母为「目标 + 跳过」，跳过的工作同样计入，随各组完成收敛到 100%。
+  const skippedTotal = (t.skippedExisting || 0) + (t.skippedNoImage || 0) + (t.skippedNoDatasheet || 0);
+  const processed = t.collected + skippedTotal;
+  const planned = (t.totalProducts || 0) + skippedTotal;
+  const pct = planned ? Math.round(processed / planned * 100) : 0;
   document.getElementById('mainBar').style.width = pct + '%';
   document.getElementById('mainPct').textContent = pct + '%';
   document.getElementById('stopBtn').style.display = t.status === 'running' ? '' : 'none';
@@ -403,11 +507,27 @@ function renderTask(t) {
   const groups = Object.entries(t.groups || {});
   const tbody = document.querySelector('#groupTable tbody');
   tbody.innerHTML = groups.map(([name, g], i) => {
-    const p = g.target ? Math.round(g.collected / g.target * 100) : 0;
+    const skipped = g.skipped || 0;
+    // 与总进度同口径：已处理 / (目标 + 跳过)。目标为 0 时：有跳过即「已全部存在」=100%，
+    // 否则该组本就没有在售商品，完成即 100%。
+    const denom = (g.target || 0) + skipped;
+    const p = denom ? Math.round((g.collected + skipped) / denom * 100)
+                    : (g.done ? 100 : 0);
+    let st;
+    if (g.target) {
+      st = `<span class="st-main">${g.collected}/${g.target} ${g.done ? '✅' : ''}</span>`
+         + (skipped ? `<span class="st-skip">跳过 ${skipped}</span>` : '');
+    } else if (skipped) {
+      st = `<span class="st-all">全部已跳过（${skipped}）</span>`;
+    } else if (g.done) {
+      st = '<span class="st-skip">无在售商品</span>';
+    } else {
+      st = '—';
+    }
     return `<tr>
       <td>${i + 1}</td><td>${name}</td>
       <td><div class="bar" style="height:8px"><i style="width:${p}%"></i></div></td>
-      <td>${g.collected}/${g.target} ${g.done ? '✅' : ''}</td>
+      <td><div class="st-cell">${st}</div></td>
     </tr>`;
   }).join('');
 
@@ -428,7 +548,159 @@ function renderTask(t) {
     document.getElementById('excelHint').textContent =
       t.status === 'done' ? '采集完成，点击下载 Excel' : '任务未全部完成，可先导出已采集部分';
   }
+
+  // 商品数据卡片：采集条数变化或任务结束时刷新
+  const terminal = t.status === 'done' || t.status === 'cancelled' || t.status === 'error';
+  if (t.collected !== lastProdCollected) {
+    lastProdCollected = t.collected;
+    scheduleProducts(terminal);
+  }
 }
+
+// ---- 商品数据预览（去重后，按类目分组 + 条数）----
+let prodLoading = false;
+let prodTimer = null;
+let lastProdCollected = 0;
+let lastProdData = null;   // 最近一次接口数据（总数 / 各类目完整计数 / 是否还有更多）
+let prodCatFilter = '';     // 当前选中的类目（'' = 全部）
+let prodRowsByName = new Map();  // 已加载商品行：类目名 -> rows[]（分页累加）
+const PROD_PAGE = 2000;          // 每页条数（后端上限 5000）
+
+function resetProducts() {
+  lastProdCollected = 0;
+  lastProdData = null;
+  prodCatFilter = '';
+  prodRowsByName = new Map();
+  document.getElementById('prodGrid').innerHTML = '';
+  document.getElementById('prodSummary').innerHTML = '';
+  document.getElementById('prodEmpty').style.display = '';
+  document.getElementById('prodPanel').style.display = 'none';
+  document.getElementById('prodCount').textContent = '';
+}
+
+function scheduleProducts(immediate) {
+  if (prodTimer) clearTimeout(prodTimer);
+  prodTimer = setTimeout(() => { prodTimer = null; loadProducts(); }, immediate ? 0 : 1000);
+}
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function renderProdItem(row) {
+  const model = row['型号'] || row['商品编号'] || '(无型号)';
+  const link = /^https?:/.test(row['详情链接'] || '') ? row['详情链接'] : '';
+  const title = link ? `<a href="${esc(link)}" target="_blank" rel="noopener">${esc(model)}</a>` : esc(model);
+  const img = /^https?:/.test(row['图片链接'] || '')
+    ? `<img src="${esc(row['图片链接'])}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">`
+    : `<div class="pi-ph">无图</div>`;
+  const price = (row['单价'] == null || row['单价'] === '') ? '—' : ('¥' + row['单价']);
+  const stock = (row['库存'] == null || row['库存'] === '') ? '—' : row['库存'];
+  return `<div class="prod-item">
+    ${img}
+    <div class="pi-body">
+      <div class="pi-model">${title}</div>
+      <div><span class="pi-k">编号</span> ${esc(row['商品编号']) || '—'}</div>
+      <div><span class="pi-k">品牌</span> ${esc(row['品牌']) || '—'}<span class="pi-k"> · 封装</span> ${esc(row['封装']) || '—'}</div>
+      <div><span class="pi-k">库存</span> ${esc(stock)} <span class="pi-price">${esc(price)}</span></div>
+    </div>
+  </div>`;
+}
+
+async function loadProducts(more) {
+  if (!currentTaskId || prodLoading) return;
+  prodLoading = true;
+  try {
+    const onlyImg = document.getElementById('onlyWithImg').checked ? '&onlyWithImg=true' : '';
+    const offset = more && lastProdData ? lastProdData.nextOffset : 0;
+    const r = await fetch(`/api/tasks/${currentTaskId}/products?limit=${PROD_PAGE}&offset=${offset}${onlyImg}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!more) prodRowsByName = new Map();   // 重新加载（首屏/切换筛选）时清空已累加的行
+    d.groups.forEach(g => {
+      if (g.rows.length) {
+        prodRowsByName.set(g.name, (prodRowsByName.get(g.name) || []).concat(g.rows));
+      }
+    });
+    lastProdData = d;
+    // 筛选的类目在新结果里已不存在（如切换了「只看有图」）时，回到「全部」
+    if (prodCatFilter && !d.groups.some(g => g.name === prodCatFilter && g.count > 0)) {
+      prodCatFilter = '';
+    }
+    renderProducts();
+  } finally {
+    prodLoading = false;
+  }
+}
+
+function loadMoreProducts() {
+  if (!lastProdData || !lastProdData.hasMore || prodLoading) return;
+  loadProducts(true);
+}
+
+function onImgFilterChange() {
+  loadProducts();
+}
+
+function renderProducts() {
+  const d = lastProdData;
+  if (!d) return;
+  const onlyImg = document.getElementById('onlyWithImg').checked;
+  const shown = d.groups.filter(g => g.count > 0);
+  const hasAny = d.total || d.skippedExisting || d.skippedNoImage || d.skippedNoDatasheet;
+  const rowsShown = [...prodRowsByName.values()].reduce((n, a) => n + a.length, 0);
+  document.getElementById('prodEmpty').style.display = hasAny ? 'none' : '';
+  document.getElementById('prodPanel').style.display = hasAny ? '' : 'none';
+  document.getElementById('prodCount').textContent = d.total
+    ? `${onlyImg ? '有图商品' : '去重后'}共 ${d.total} 条 · ${shown.length} 个类目`
+      + (rowsShown < d.total ? ` · 已展示 ${rowsShown} 条` : '')
+      + (d.skippedExisting ? ` · 跳过库中已有 ${d.skippedExisting} 条` : '')
+      + (d.skippedNoImage ? ` · 跳过图片不合规 ${d.skippedNoImage} 条` : '')
+      + (d.skippedNoDatasheet ? ` · 跳过无数据手册 ${d.skippedNoDatasheet} 条` : '')
+    : ((d.skippedExisting || d.skippedNoImage || d.skippedNoDatasheet)
+        ? `全部被跳过（库中已有 ${d.skippedExisting || 0} 条 · 图片不合规 ${d.skippedNoImage || 0} 条 · 无数据手册 ${d.skippedNoDatasheet || 0} 条）`
+        : (onlyImg ? '没有符合条件的商品' : ''));
+
+  // 胶囊：点击按类目筛选（计数用各类目完整条数，不受分页影响）
+  document.getElementById('prodSummary').innerHTML =
+    `<span class="cat-chip ${prodCatFilter === '' ? 'active' : ''}" data-cat="">全部<b>${d.total}</b></span>`
+    + shown.map(g =>
+      `<span class="cat-chip ${prodCatFilter === g.name ? 'active' : ''}" data-cat="${esc(g.name)}">${esc(g.name)}<b>${g.count}</b></span>`
+    ).join('');
+
+  const groups = prodCatFilter ? shown.filter(g => g.name === prodCatFilter) : shown;
+  // 只渲染已加载到行的类目（尚未加载到行的类目会在「加载更多」后出现）
+  const list = groups
+    .map(g => ({ name: g.name, count: g.count, rows: prodRowsByName.get(g.name) || [] }))
+    .filter(g => g.rows.length);
+  // 当前视图还有多少行未加载（用于决定是否显示「加载更多」）
+  const pendingRows = groups.reduce(
+    (n, g) => n + Math.max(0, g.count - (prodRowsByName.get(g.name) || []).length), 0);
+  const grid = document.getElementById('prodGrid');
+  if (!list.length && !pendingRows) {
+    grid.innerHTML = hasAny ? '<div class="empty">该条件下暂无商品。</div>' : '';
+    return;
+  }
+  grid.innerHTML = list.map(g => `
+    <div class="prod-group">
+      <div class="prod-group-head">${esc(g.name)} <span class="pi-k">· ${g.count} 条</span></div>
+      <div class="prod-items">${g.rows.map(renderProdItem).join('')}</div>
+    </div>`).join('')
+    + (d.hasMore && pendingRows
+        ? `<div class="load-more"><button class="btn ghost" style="padding:8px 20px;font-size:13px" onclick="loadMoreProducts()">加载更多（已展示 ${rowsShown} / ${d.total} 条）</button></div>`
+        : '');
+}
+
+// 胶囊点击筛选（事件委托，避免类目名里的引号破坏内联 onclick）
+document.getElementById('prodSummary').addEventListener('click', e => {
+  const el = e.target.closest('.cat-chip');
+  if (!el) return;
+  const cat = el.getAttribute('data-cat') || '';
+  prodCatFilter = (cat === '' || prodCatFilter === cat) ? '' : cat;
+  renderProducts();
+});
 
 function downloadExcel(ev) {
   ev.preventDefault();
@@ -437,9 +709,25 @@ function downloadExcel(ev) {
   location.href = `/api/tasks/${currentTaskId}/export`;
 }
 
-loadSites();
-loadCatalog();
-loadBrands();
+async function attachLatestTask() {
+  try {
+    const r = await fetch('/api/tasks');
+    if (!r.ok) return;
+    const list = await r.json();
+    if (!list.length) return;
+    list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    currentTaskId = list[0].id;
+    subscribe(list[0].id);
+  } catch (e) { /* 忽略：无历史任务 */ }
+}
+
+async function init() {
+  await loadSites();
+  loadCatalog();
+  loadBrands();
+  await attachLatestTask();
+}
+init();
 </script>
 </body>
 </html>

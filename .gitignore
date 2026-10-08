@@ -23,6 +23,7 @@ __pycache__/
 .benchmarks
 .bootstrap
 .appveyor.token
+/lcsc_scraper
 *.bak
 *.db
 *.db-*

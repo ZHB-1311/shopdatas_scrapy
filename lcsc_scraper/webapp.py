@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .excel_export import export_task
-from .scraper import RUNNER, SITES, create_site
+from .scraper import RUNNER, SITES, create_site, has_product_image
 
 app = FastAPI(title="商城商品数据采集（立创 / 华秋 / 云汉）")
 
@@ -26,6 +26,11 @@ class TaskCreate(BaseModel):
     groupParallel: int = Field(default=3, ge=1, le=10)
     catalogs: list[dict] = []   # [{catalogId, catalogName}]
     brands: list[dict] = []     # [{brandId, brandName}]
+    skipExisting: bool = True   # 跳过数据库 sp_goods 已有商品
+    db: dict = {}               # 数据库连接覆盖项：{host,port,user,password,database,table,codeColumn,skuColumn}
+    # 图片过滤：off 不过滤 / placeholder（默认）跳过非商品图 / require 只保留有商品实拍图
+    imageFilter: str = Field(default="placeholder", pattern="^(off|placeholder|require)$")
+    datasheetFilter: bool = True  # 跳过无数据手册（PDF 链接）的商品，仅对提供该字段的站点生效
 
 
 @app.on_event("startup")
@@ -131,6 +136,68 @@ async def task_events(task_id: str):
                 yield ": keepalive\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _has_image(product: dict) -> bool:
+    """商品是否有可用的商品实拍图（品牌证书图 / 默认占位图不算有图）。"""
+    return has_product_image(product)
+
+
+@app.get("/api/tasks/{task_id}/products")
+async def task_products(
+    task_id: str, limit: int = 2000, offset: int = 0, onlyWithImg: bool = False
+):
+    """已采集（且已通过去重）的商品数据，按类目分组并给出各类目条数（支持分页）。
+
+    只包含真正进入结果的商品：同一商品在多个类目/品牌下只出现一次（采集去重），
+    且在 sp_goods 中已存在（商品编号命中 rsku_hidden，或型号命中 sku）的商品已被跳过，
+    图片不合规（品牌证书图 / 占位图，require 模式下还包括无图）的商品也已被跳过，均不会出现在这里。
+    onlyWithImg=True 时仅统计/返回有商品实拍图的商品（条数与分组计数同步收窄）。
+
+    分页：把全部商品按类目顺序拉平为一条序列，返回 [offset, offset+limit) 窗口内的行；
+    每个类目项始终带完整 count，rows 只包含落在本页窗口内的行。调用方按 offset 累加即可取全量。
+    """
+    task = RUNNER.tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    fields = ["商品编号", "型号", "品牌", "封装", "库存", "单价", "类目", "图片链接", "详情链接"]
+    limit = max(1, min(limit, 5000))
+    offset = max(0, offset)
+
+    counts = []   # [(name, count)]，保持类目顺序
+    flat = []     # [(name, item)]，全量扁平序列
+    for name, items in task.products.items():
+        sel = [it for it in items if (not onlyWithImg or _has_image(it))]
+        counts.append((name, len(sel)))
+        for it in sel:
+            flat.append((name, it))
+
+    total = len(flat)
+    window = flat[offset:offset + limit]
+
+    rows_by_group = {}
+    for name, it in window:
+        rows_by_group.setdefault(name, []).append({f: it.get(f) for f in fields})
+
+    groups = [
+        {"name": name, "count": count, "rows": rows_by_group.get(name, [])}
+        for name, count in counts
+    ]
+    next_offset = offset + len(window)
+    return {
+        "total": total,
+        "groupCount": sum(1 for _, c in counts if c > 0),
+        "offset": offset,
+        "nextOffset": next_offset,
+        "hasMore": next_offset < total,
+        "onlyWithImg": onlyWithImg,
+        "skippedExisting": task.skipped_existing,
+        "skippedNoImage": task.skipped_no_image,
+        "skippedNoDatasheet": task.skipped_no_datasheet,
+        "imageFilter": task.config.get("imageFilter") or "placeholder",
+        "fields": fields,
+        "groups": groups,
+    }
 
 
 @app.get("/api/tasks/{task_id}/export")

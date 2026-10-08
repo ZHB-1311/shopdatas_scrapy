@@ -1,5 +1,5 @@
-"""Excel 导出：按类目模式 → 每个子类目一个 sheet（参数并列为列）；
-按品牌模式 → 每个品牌一个 sheet（参数合并为一列文本）。"""
+"""Excel 导出：类目 / 品牌模式统一按「每个分组一个 sheet」输出，
+商品参数全部合并进单列 `参数`（形如 `名称:值；名称:值`）。"""
 
 from __future__ import annotations
 
@@ -17,10 +17,38 @@ BASE_COLUMNS = [
     "商品编号", "型号", "品牌", "品牌网址", "品牌简介", "类目", "商品描述", "封装",
     "库存", "近期销量", "最小起订", "包装方式", "包装规格", "单价", "价格梯度",
     "毛重", "图片链接", "数据手册PDF链接", "关联(替代产品)型号", "详情链接", "简介/备注",
+    "参数",
 ]
+
+PARAM_PREFIX = "参数:"
+PARAM_COLUMN = "参数"
+PARAM_SEP = "；"          # 参数之间用全角分号分隔
+PARAM_KV_SEP = ":"        # 名称与值之间用半角冒号
 
 HEADER_FILL = PatternFill("solid", fgColor="1F7AE0")
 HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+
+
+def format_params(product: dict) -> str:
+    """把商品的 `参数:xxx` 字段合并成单列文本：`名称:值；名称:值；…`。
+
+    保持参数在商品 dict 中的出现顺序（列表页 paramLinkedMap → 详情页 paramList 覆盖/补充），
+    跳过空值、`-`（详情页用 `-` 表示无此项）与无名参数。
+
+    值本身若含分号（立创的多值参数，如 `额定电流=3A；1A`，实测 190 处 / 73 个商品），
+    会把 `；` 换成 `,`——否则下游按 `；` 拆分会串位。值里的冒号（如 `收缩率=2:1`）保留不动。
+    """
+    parts: list[str] = []
+    for key, value in product.items():
+        if not isinstance(key, str) or not key.startswith(PARAM_PREFIX):
+            continue
+        name = key[len(PARAM_PREFIX):].strip()
+        text = "" if value is None else str(value).strip()
+        text = text.replace("；", ",").replace(";", ",")
+        if not name or text in ("", "-"):
+            continue
+        parts.append(f"{name}{PARAM_KV_SEP}{text}")
+    return PARAM_SEP.join(parts)
 
 
 def _safe_sheet_name(name: str, used: set[str]) -> str:
@@ -53,44 +81,18 @@ def _auto_width(ws, max_width: int = 46) -> None:
                 # 中文字符按2个宽度计
                 w = sum(2 if ord(c) > 127 else 1 for c in s[:80])
                 width = max(width, min(w + 2, max_width))
+        # 参数列内容长，给足宽度（上限放宽，便于一眼看完）
+        if ws.cell(row=1, column=col_idx).value == PARAM_COLUMN:
+            width = 80
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
 def _write_category_sheet(ws, products: list[dict]) -> None:
-    # 参数列 = 所有商品参数名的并集，保持首次出现顺序
-    param_cols: list[str] = []
-    seen = set()
-    for p in products:
-        for k in p:
-            if k.startswith("参数:") and k not in seen:
-                seen.add(k)
-                param_cols.append(k)
-    columns = BASE_COLUMNS + param_cols
-
+    columns = BASE_COLUMNS
     ws.append(columns)
     _style_header(ws)
     for p in products:
-        ws.append([p.get(c) for c in columns])
-    _auto_width(ws)
-
-
-def _param_text(p: dict) -> str:
-    parts = []
-    for k, v in p.items():
-        if k.startswith("参数:") and v not in (None, ""):
-            parts.append(f"{k[3:]}={v}")
-    return " | ".join(parts)
-
-
-def _write_brand_sheet(ws, products: list[dict]) -> None:
-    columns = BASE_COLUMNS + ["商品参数", "参数错误"]
-    ws.append(columns)
-    _style_header(ws)
-    for p in products:
-        row = [p.get(c) for c in BASE_COLUMNS]
-        row.append(_param_text(p))
-        row.append(p.get("参数错误", ""))
-        ws.append(row)
+        ws.append([format_params(p) if c == PARAM_COLUMN else p.get(c) for c in columns])
     _auto_width(ws)
 
 
@@ -111,10 +113,7 @@ def export_task(task: ScrapeTask) -> Path:
     used: set[str] = set()
     for group, products in task.products.items():
         ws = wb.create_sheet(_safe_sheet_name(group, used))
-        if task.mode == "category":
-            _write_category_sheet(ws, products)
-        else:
-            _write_brand_sheet(ws, products)
+        _write_category_sheet(ws, products)
     if not wb.sheetnames:
         ws = wb.create_sheet("无数据")
         ws.append(["未采集到数据"])

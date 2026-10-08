@@ -19,12 +19,60 @@ from .client import (
     LcscClient,
     LcscError,
 )
+from .db import ExistingIndex, fetch_existing_index, load_db_config
 from .hqchip import HqChipClient
 from .ickey import IcKeyClient
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
+
+# 图片过滤模式（任务配置 imageFilter）
+IMAGE_FILTER_OFF = "off"          # 不过滤
+IMAGE_FILTER_PLACEHOLDER = "placeholder"  # 默认：跳过「非商品实拍图」（品牌证书图 / 默认占位图）
+IMAGE_FILTER_REQUIRE = "require"  # 跳过「非商品图」与「无图」，只保留有商品实拍图的商品
+DEFAULT_IMAGE_FILTER = IMAGE_FILTER_PLACEHOLDER
+
+# 「非商品实拍图」的 URL 特征。实测（data/ 8543 条样本）占 11%：
+#   - 立创：/upload/public/brand/product/certificate/…（品牌证书图，860 条仅 16 张不同图，
+#     同一品牌下所有商品共用，列表页缩略图因此全部相同）
+#   - 云汉：static-ickey/assets/…/img/pic/default_list_logo.jpg（默认占位图，89 条共用 1 张）
+NON_PRODUCT_IMAGE_MARKS = (
+    "/brand/product/certificate/",
+    "default_list_logo",
+    "/img/pic/default",
+    "placeholder",
+    "no_img",
+)
+
+
+def is_non_product_image(url: object) -> bool:
+    """图片 URL 是否为「非商品实拍图」（品牌证书图 / 默认占位图）。"""
+    text = str(url or "").strip().lower()
+    return any(mark in text for mark in NON_PRODUCT_IMAGE_MARKS)
+
+
+def has_product_image(product: dict) -> bool:
+    """商品是否有可用的商品实拍图（有 URL 且不是非商品图）。"""
+    url = str(product.get("图片链接") or "").strip()
+    if not url.lower().startswith("http"):
+        return False
+    return not is_non_product_image(url)
+
+
+def passes_image_filter(product: dict, mode: str) -> bool:
+    """商品图片是否满足 imageFilter 要求。
+
+    - off：一律通过
+    - placeholder（默认）：无图通过，非商品图（证书图 / 占位图）不通过
+    - require：只通过有商品实拍图的商品（无图与非商品图都不通过）
+    """
+    if mode == IMAGE_FILTER_OFF:
+        return True
+    url = str(product.get("图片链接") or "").strip()
+    if not url.lower().startswith("http"):
+        return mode != IMAGE_FILTER_REQUIRE  # 无图：仅 require 模式跳过
+    return not is_non_product_image(url)
 
 
 def _node_leaves(node: dict) -> list[dict]:
@@ -40,6 +88,41 @@ def _node_leaves(node: dict) -> list[dict]:
         return out
 
     return collect(node)
+
+
+def _expand_leaves(
+    groups: list[dict], selected: Optional[list[dict]] = None
+) -> list[tuple[str, list[str]]]:
+    """把选中的分组展开为「展示名 -> [类目ID]」列表（类目 / 品牌模式共用）。
+
+    - selected 为空时展开全部分组的全部叶子。
+    - 一个展示分组可含多个类目 ID（leaf 带 childIds 时）。
+    """
+    if not selected:
+        selected = [
+            {"catalogId": g["catalogId"], "catalogName": g.get("catalogName")} for g in groups
+        ]
+    ordered: dict[str, list[str]] = {}
+    for sel in selected:
+        sid = str(sel["catalogId"])
+        expanded: list[dict] = []
+        for g in groups:
+            if str(g["catalogId"]) == sid:
+                expanded = list(g.get("leaves") or [])
+                break
+            leaf = next(
+                (l for l in g.get("leaves") or [] if str(l["catalogId"]) == sid), None
+            )
+            if leaf:
+                expanded = [leaf]
+                break
+        if not expanded:
+            expanded = [{"catalogId": sid, "catalogName": sel.get("catalogName") or sid}]
+        for leaf in expanded:
+            name = leaf.get("group") or leaf.get("catalogName") or str(leaf["catalogId"])
+            ids = leaf.get("childIds") or [str(leaf["catalogId"])]
+            ordered.setdefault(name, []).extend(str(i) for i in ids)
+    return list(ordered.items())
 
 
 def _leaves_of_node(tree: dict, node_id: int) -> list[dict]:
@@ -77,12 +160,15 @@ class LcscSite:
     id = "lcsc"
     label = "立创商城"
     supports_brand = True
+    supports_datasheet = True   # 列表页 fileTypeVOList 能给到数据手册 PDF 链接
 
     def __init__(self, concurrency: int = 6):
         self.client = LcscClient(concurrency=concurrency)
         self._cat_map: Optional[dict] = None  # catalogId -> catalogName（惰性构建）
-        self._brand_web: dict[str, dict] = {}  # 品牌ID -> currentBrand（官网/简介，惰性缓存）
+        self._brand_info: dict[str, Optional[dict]] = {}  # 品牌ID -> 品牌页 searchResult（惰性缓存）
+        self._brand_meta: dict[str, Optional[dict]] = {}  # 品牌ID -> currentBrand 官网/简介（惰性缓存）
         self._brand_lock = asyncio.Lock()
+        self._brand_meta_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -127,8 +213,10 @@ class LcscSite:
                 break
         return groups
 
-    async def category_page(self, catalog_id, page: int) -> tuple[list[dict], int]:
-        result = await self.client.category_products_page(int(catalog_id), page)
+    async def category_page(self, catalog_id, page: int, brand_id=None) -> tuple[list[dict], int]:
+        result = await self.client.category_products_page(
+            int(catalog_id), page, brand_id=brand_id
+        )
         search = result.get("searchResult") or {}
         total = int(result.get("totalCount") or search.get("totalCount") or 0)
         cat_name = result.get("catalogName") or ""
@@ -228,21 +316,14 @@ class LcscSite:
         if brand.get("brandName"):
             product["品牌"] = brand["brandName"]
             product["品牌ID"] = brand.get("brandId")
-        # 品牌网址（厂商官网）+ 品牌简介：按 brandId 缓存，每个品牌仅请求一次
+        # 品牌网址（厂商官网）+ 品牌简介：按 brandId 惰性缓存，每个品牌仅请求一次。
+        # 数据源是品牌商品列表接口（client.brand_meta），不是品牌页——品牌页被腾讯验证码拦截，
+        # 用它会导致这两个字段全空（见 AGENTS.md「品牌网址 / 品牌简介」一节）。
         bid = product.get("品牌ID")
         if bid not in (None, ""):
-            key = str(bid)
-            if key not in self._brand_web:
-                async with self._brand_lock:
-                    if key not in self._brand_web:
-                        try:
-                            info = await self.client.brand_detail(key)
-                        except Exception:  # noqa: BLE001
-                            info = {}
-                        self._brand_web[key] = info or {}
-            info = self._brand_web.get(key) or {}
-            product["品牌网址"] = info.get("companyWebsite") or ""
-            product["品牌简介"] = info.get("companyContext") or ""
+            current = await self.brand_meta(bid) or {}
+            product["品牌网址"] = current.get("companyWebsite") or ""
+            product["品牌简介"] = current.get("companyContext") or ""
         # 商品参数：详情页 paramList 覆盖/补充列表页 paramLinkedMap
         for p in web.get("paramList") or []:
             name = p.get("parameterName")
@@ -270,10 +351,93 @@ class LcscSite:
                 models = []
             if models:
                 product["关联(替代产品)型号"] = " | ".join(models)
+        # 引脚图 / 焊盘图：不再抓取 —— 导出已不要这两列，而每个商品要多打一次 lceda.cn 请求。
+        # 需要时用 client.pinpad_urls(商品编号) 单独取（方法保留）。
         return product
+
+    async def brand_info(self, brand_id) -> Optional[dict]:
+        """品牌页 searchResult（currentBrand 官网/简介 + catalogGroup 子类目分面）。
+
+        按品牌缓存；请求失败或返回空（如被腾讯验证码拦截、无 __NEXT_DATA__）时缓存为 None，
+        调用方需自行处理 None —— 注意 None 表示「探测失败」，不可当作「品牌无商品」。
+        """
+        key = str(brand_id)
+        if key not in self._brand_info:
+            async with self._brand_lock:
+                if key not in self._brand_info:
+                    try:
+                        info = await self.client.brand_page_info(key)
+                    except Exception:  # noqa: BLE001
+                        info = None
+                    if not info:
+                        logger.warning("品牌页探测失败（可能被验证码拦截）: brandId=%s", key)
+                        self._brand_info[key] = None
+                    else:
+                        self._brand_info[key] = info
+        return self._brand_info[key]
+
+    async def brand_meta(self, brand_id) -> Optional[dict]:
+        """品牌元信息 currentBrand（官网 companyWebsite / 简介 companyContext），按品牌缓存。
+
+        数据源为品牌商品列表接口（`client.brand_meta`）；探测失败时缓存 None（字段留空）。
+        与 `brand_info` 分开：后者走被验证码拦截的品牌页，只有品牌模式探测子类目条数在用。
+        """
+        key = str(brand_id)
+        if key not in self._brand_meta:
+            async with self._brand_meta_lock:
+                if key not in self._brand_meta:
+                    try:
+                        meta = await self.client.brand_meta(key)
+                    except Exception:  # noqa: BLE001
+                        meta = {}
+                    if not meta:
+                        logger.warning("品牌元信息探测失败: brandId=%s", key)
+                        self._brand_meta[key] = None
+                    else:
+                        self._brand_meta[key] = meta
+        return self._brand_meta[key]
+
+    async def brand_scope(self, brand_id) -> dict[str, int]:
+        """品牌在各子类目下的在售商品数: {子类目ID: 商品数}。
+
+        取品牌页 catalogGroup 分面（与「类目 + 品牌」列表接口 totalCount 一致），
+        用于探测该品牌实际有商品的子类目，避免对无商品的「品牌 × 子类目」组合发请求。
+        探测失败抛异常，由调用方决定降级策略。
+        """
+        info = await self.brand_info(brand_id)
+        # 必须是有效品牌页结果：为空，或既无 totalCount 也无 catalogGroup，都视为探测失败
+        # （不可当作「品牌无商品」，否则会静默漏采，需降级到逐类目统计）
+        if not info or ("totalCount" not in info and "catalogGroup" not in info):
+            raise LcscError(f"品牌页探测失败: brandId={brand_id}")
+        scope: dict[str, int] = {}
+        for it in info.get("catalogGroup") or []:
+            cid, count = it.get("value"), it.get("count")
+            if cid is None or count is None:
+                continue
+            scope[str(cid)] = int(count)
+        return scope
 
     async def brands(self) -> dict[str, list[dict]]:
         return await self.client.brand_map(DEFAULT_TOP_CATALOG_IDS)
+
+    async def brand_leaf_counts(
+        self, brand_id: int, leaves: list[tuple[str, list[str]]]
+    ) -> dict[str, int]:
+        """逐子类目精确统计该品牌的可采条数（品牌页不可用时的降级探测）。
+
+        用「类目 + 品牌」列表接口的 totalCount：每个子类目一次请求，
+        并发由 client 自带的并发信号量控制。返回 {子类目名: 可采条数}。
+        """
+
+        async def one(name: str, ids: list[str]) -> tuple[str, int]:
+            avail = 0
+            for cid in ids:
+                _products, total = await self.category_page(cid, 1, brand_id)
+                avail += total
+            return name, avail
+
+        pairs = await asyncio.gather(*(one(n, i) for n, i in leaves))
+        return dict(pairs)
 
     async def brand_page(self, brand_id: int, page: int) -> tuple[list[dict], int]:
         result = await self.client.brand_products_page(brand_id, page)
@@ -293,6 +457,7 @@ class HqSite:
     id = "hqchip"
     label = "华秋商城"
     supports_brand = False
+    supports_datasheet = False  # 站点/解析均无数据手册链接（实测 0%）
 
     def __init__(self, concurrency: int = 6):
         self.client = HqChipClient(concurrency=concurrency)
@@ -324,6 +489,9 @@ class HqSite:
     async def brands(self) -> dict[str, list[dict]]:
         raise LcscError("华秋商城不支持品牌维度采集")
 
+    async def brand_scope(self, brand_id) -> dict[str, int]:
+        raise LcscError("华秋商城不支持品牌维度采集")
+
     async def brand_page(self, brand_id: int, page: int) -> tuple[list[dict], int]:
         raise LcscError("华秋商城不支持品牌维度采集")
 
@@ -334,6 +502,7 @@ class IcKeySite:
     id = "ickey"
     label = "云汉芯城"
     supports_brand = False
+    supports_datasheet = False  # 站点/解析均无数据手册链接（实测 0%）
 
     def __init__(self, concurrency: int = 6):
         self.client = IcKeyClient(concurrency=concurrency)
@@ -354,6 +523,9 @@ class IcKeySite:
         return product
 
     async def brands(self) -> dict[str, list[dict]]:
+        raise LcscError("云汉芯城不支持品牌维度采集")
+
+    async def brand_scope(self, brand_id) -> dict[str, int]:
         raise LcscError("云汉芯城不支持品牌维度采集")
 
     async def brand_page(self, brand_id: int, page: int) -> tuple[list[dict], int]:
@@ -394,11 +566,18 @@ class ScrapeTask:
         self.collected = 0
         self.detail_done = 0
         self.errors = 0
+        self.skipped_existing = 0  # 命中数据库已有商品、被跳过的条数
+        self.skipped_no_image = 0  # 图片不合规（证书图 / 占位图 / 无图）、被跳过的条数
+        self.skipped_no_datasheet = 0  # 无数据手册、被跳过的条数（仅支持该字段的站点计入）
         self.groups: dict[str, dict] = {}  # group名 -> {target, collected, done}
         self.current = ""
         self.logs: deque[str] = deque(maxlen=500)
         # 结果
         self.products: dict[str, list[dict]] = {}  # group名 -> [商品]
+        # 采集去重：全局已见商品标识（跨子类目 / 品牌共享）
+        self.seen_ids: set[str] = set()
+        # 数据库 sp_goods 已有商品（商品编号 / 型号），采集时跳过
+        self.existing: ExistingIndex = ExistingIndex()
         self._jsonl_path: Optional[Path] = None
         self._jsonl = None
         self.cancel_event = asyncio.Event()
@@ -428,6 +607,9 @@ class ScrapeTask:
             "collected": self.collected,
             "detailDone": self.detail_done,
             "errors": self.errors,
+            "skippedExisting": self.skipped_existing,
+            "skippedNoImage": self.skipped_no_image,
+            "skippedNoDatasheet": self.skipped_no_datasheet,
             "groups": self.groups,
             "current": self.current,
             "error": self.error,
@@ -457,7 +639,12 @@ class ScrapeTask:
             "mode": self.mode,
             "config": self.config,
             "status": self.status,
-            "groups": {k: v["target"] for k, v in self.groups.items()},
+            "createdAt": self.created_at,
+            "finishedAt": self.finished_at,
+            "groups": {
+                k: {"target": v.get("target", 0), "skipped": v.get("skipped", 0)}
+                for k, v in self.groups.items()
+            },
         }
         (DATA_DIR / f"task_{self.id}.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -500,9 +687,20 @@ class TaskRunner:
                 task = ScrapeTask(meta.get("site") or "lcsc", meta["mode"], meta.get("config") or {})
                 task.id = tid
                 task.status = meta.get("status") or "done"
-                task.finished_at = task.created_at
-                for name, target in (meta.get("groups") or {}).items():
-                    task.groups[name] = {"target": target, "collected": 0, "done": True}
+                # 恢复真实时间戳，保证「最近任务」排序正确（旧记录缺该字段时回退）
+                if meta.get("createdAt"):
+                    task.created_at = float(meta["createdAt"])
+                task.finished_at = float(meta["finishedAt"]) if meta.get("finishedAt") else task.created_at
+                for name, ginfo in (meta.get("groups") or {}).items():
+                    if isinstance(ginfo, dict):
+                        task.groups[name] = {
+                            "target": ginfo.get("target", 0),
+                            "collected": 0,
+                            "skipped": ginfo.get("skipped", 0),
+                            "done": True,
+                        }
+                    else:  # 兼容旧格式（值为 target 数字）
+                        task.groups[name] = {"target": ginfo, "collected": 0, "done": True}
                 jsonl = DATA_DIR / f"task_{tid}.jsonl"
                 if jsonl.exists():
                     for line in jsonl.read_text(encoding="utf-8").splitlines():
@@ -538,6 +736,7 @@ class TaskRunner:
     async def _run(self, task: ScrapeTask) -> None:
         task.status = "running"
         task._open_jsonl()
+        await self._load_existing_index(task)
         site = create_site(task.site, int(task.config.get("concurrency", 6)))
         try:
             if task.mode == "category":
@@ -566,38 +765,47 @@ class TaskRunner:
 
     # ---------- 按类目 ----------
 
+    async def _load_existing_index(self, task: ScrapeTask) -> None:
+        """读取服务器数据库 sp_goods 已有商品编号 / 型号，采集时据此跳过（不可用时跳过过滤）。"""
+        if not task.config.get("skipExisting", True):
+            task.log("未开启「跳过数据库已有商品」")
+            return
+        cfg = load_db_config(task.config.get("db") or {})
+        if not cfg.get("enabled", True):
+            task.log("数据库过滤已在配置中关闭")
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            index = await loop.run_in_executor(None, fetch_existing_index, cfg)
+        except Exception as exc:  # noqa: BLE001
+            task.log(f"读取数据库异常，未启用「已有商品」过滤: {exc}")
+            return
+        if index.error:
+            task.log(f"读取数据库失败，本次不按「已有商品」过滤：{index.error}")
+        elif index:
+            task.existing = index
+            parts = [f"{len(index.codes)} 个商品编号"]
+            if index.skus:
+                parts.append(f"{len(index.skus)} 个型号")
+            excl = cfg.get("excludeProductSource")
+            scope = "全部 Product_Source" if excl is None else f"已排除 Product_Source={excl}"
+            task.log(
+                f"数据库 {cfg['database']}.{cfg['table']} 已有 "
+                + "、".join(parts)
+                + f"（{scope}），采集时商品编号或型号命中即跳过"
+            )
+        else:
+            task.log(
+                f"数据库 {cfg['database']}.{cfg['table']} 中暂无商品编号 / 型号，"
+                f"本次不按「已有商品」过滤"
+            )
+
     async def _run_category(self, task: ScrapeTask, site) -> None:
         groups = await site.catalog_groups()
-        selected = task.config.get("catalogs") or []
-        if not selected:
-            # 默认所有分组的全部叶子
-            selected = [
-                {"catalogId": g["catalogId"], "catalogName": g["catalogName"]} for g in groups
-            ]
-        # 展开成叶子，并按「展示分组」聚合：一个分组可含多个类目 ID。
-        # 注意：类目 ID 统一用字符串（云汉的 ID 带前导零，如 0701）。
-        # leaf 可带 childIds（展示为一个类目、内部展开多个三级子类）。
-        ordered: dict[str, list[str]] = {}  # group 展示名 -> [类目ID]
-        for sel in selected:
-            sid = str(sel["catalogId"])
-            expanded: list[dict] = []
-            for g in groups:
-                gid = str(g["catalogId"])
-                if gid == sid:
-                    expanded = list(g["leaves"])
-                    break
-                leaf = next((l for l in g["leaves"] if str(l["catalogId"]) == sid), None)
-                if leaf:
-                    expanded = [leaf]
-                    break
-            if not expanded:
-                expanded = [{"catalogId": sid, "catalogName": sel.get("catalogName") or sid}]
-            for leaf in expanded:
-                name = leaf.get("group") or leaf.get("catalogName") or str(leaf["catalogId"])
-                ids = leaf.get("childIds") or [str(leaf["catalogId"])]
-                ordered.setdefault(name, []).extend(str(i) for i in ids)
-
-        leaves: list[tuple[str, list[str]]] = list(ordered.items())
+        # 展开成叶子，并按「展示分组」聚合（与品牌模式共用 _expand_leaves）
+        leaves: list[tuple[str, list[str]]] = _expand_leaves(
+            groups, task.config.get("catalogs") or []
+        )
 
         per_count = int(task.config.get("perCount", 2))
         task.total_products = per_count * len(leaves)
@@ -630,29 +838,109 @@ class TaskRunner:
     # ---------- 按品牌 ----------
 
     async def _run_brand(self, task: ScrapeTask, site) -> None:
+        """品牌模式：先探测每个品牌在各子类目下的在售商品数，再只采集有商品的组合。
+
+        - 探测：每个品牌一次品牌页请求，取「品牌 × 子类目」商品数分面（catalogGroup），
+          与「类目 + 品牌」列表接口的 totalCount 一致。
+        - 目标：子类目目标 = Σ_品牌 min(perCount, 该品牌在该子类的商品数)，即进度目标
+          就是真正会采集的条数；没有商品的组合不建分组、不发请求。
+        - 分组名 = 子类目名（同一子类目跨品牌合并为一个 sheet），按商品去重。
+        """
         brands = task.config.get("brands") or []
         if not brands:
             raise LcscError("未选择品牌")
+        groups = await site.catalog_groups()
+        # 与类目模式共用叶子展开逻辑（默认全部分组的全部子类目）
+        leaves: list[tuple[str, list[str]]] = _expand_leaves(groups, [])
         per_count = int(task.config.get("perCount", 2))
-        task.total_products = per_count * len(brands)
-        for b in brands:
-            task.groups.setdefault(
-                b["brandName"], {"target": per_count, "collected": 0, "done": False}
-            )
-        task.log(f"共 {len(brands)} 个品牌，每个采集 {per_count} 条")
+
+        # ---- 探测：品牌 -> {子类目ID: 商品数} ----
+        task.current = f"探测 {len(brands)} 个品牌的在售子类目"
+        task.log(f"探测 {len(brands)} 个品牌在 {len(leaves)} 个子类目下的在售商品…")
+        scopes = await asyncio.gather(
+            *(site.brand_scope(int(b["brandId"])) for b in brands), return_exceptions=True
+        )
+        plans: dict[tuple[str, str], int] = {}  # (子类目, 品牌ID) -> 计划采集条数
+        probe_failed: list[str] = []
+        for done_n, (b, scope) in enumerate(zip(brands, scopes), start=1):
+            bid = str(b["brandId"])
+            if isinstance(scope, Exception):
+                # 品牌页探测失败（如被腾讯验证码拦截）：改用「类目 + 品牌」列表接口逐类目精确统计
+                task.log(
+                    f"[{b['brandName']}] 品牌页探测失败，改用「类目+品牌」逐类目统计: {scope}"
+                )
+                counts: Optional[dict[str, int]] = None
+                if hasattr(site, "brand_leaf_counts"):
+                    try:
+                        counts = await site.brand_leaf_counts(int(b["brandId"]), leaves)
+                    except Exception as exc:  # noqa: BLE001
+                        task.log(f"[{b['brandName']}] 逐类目统计失败，按全部子类目尝试: {exc}")
+                        counts = None
+                if counts is None:
+                    probe_failed.append(b["brandName"])
+                    for name, _ids in leaves:
+                        plans[(name, bid)] = per_count
+                else:
+                    hit_n = 0
+                    for name, _ids in leaves:
+                        avail = counts.get(name, 0)
+                        if avail > 0:
+                            plans[(name, bid)] = min(per_count, avail)
+                            hit_n += 1
+                    task.log(f"[{b['brandName']}] 命中 {hit_n} 个子类目")
+            else:
+                hit_n = 0
+                for name, ids in leaves:
+                    avail = sum(scope.get(cid, 0) for cid in ids)
+                    if avail > 0:
+                        plans[(name, bid)] = min(per_count, avail)
+                        hit_n += 1
+                task.log(f"[{b['brandName']}] 命中 {hit_n} 个子类目")
+            task.current = f"探测品牌 {done_n}/{len(brands)}"
+            task._notify()
+        task.current = ""
+
+        task.total_products = sum(plans.values())
+        for name, _ids in leaves:
+            target = sum(plans.get((name, str(b["brandId"])), 0) for b in brands)
+            if target:
+                task.groups.setdefault(name, {"target": target, "collected": 0, "done": False})
+        task.log(
+            f"共 {len(brands)} 个品牌 × {len(leaves)} 个子类目，"
+            f"命中 {len(task.groups)} 个子类目、目标 {task.total_products} 条"
+            f"（每个品牌每子类最多 {per_count} 条）"
+            + (f"；{len(probe_failed)} 个品牌探测失败按全类目尝试" if probe_failed else "")
+        )
+        if not plans:
+            task.log("所选品牌在这些子类目下均无在售商品，任务结束")
+            return
 
         sem = asyncio.Semaphore(max(1, int(task.config.get("groupParallel", 3))))
 
-        async def run_brand(b: dict) -> None:
+        async def run_one(b: dict, name: str, ids: list[str]) -> None:
             async with sem:
                 await self._scrape_group(
                     task,
                     site,
-                    group_name=b["brandName"],
-                    fetch_page=lambda p: site.brand_page(int(b["brandId"]), p),
-                    per_count=per_count,
+                    group_name=name,
+                    fetch_page=None,
+                    per_count=plans[(name, str(b["brandId"]))],
+                    catalog_ids=ids,
+                    brand_id=int(b["brandId"]),
+                    mark_done=False,
                 )
-        results = await asyncio.gather(*(run_brand(b) for b in brands), return_exceptions=True)
+
+        todo = [
+            (b, name, ids)
+            for b in brands
+            for name, ids in leaves
+            if (name, str(b["brandId"])) in plans
+        ]
+        results = await asyncio.gather(
+            *(run_one(b, name, ids) for b, name, ids in todo), return_exceptions=True
+        )
+        for name in task.groups:
+            task.groups[name]["done"] = True
         for r in results:
             if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
                 task.errors += 1
@@ -668,10 +956,26 @@ class TaskRunner:
         fetch_page: Optional[Callable[[int], Any]],
         per_count: int,
         catalog_ids: Optional[list[str]] = None,
+        brand_id: Optional[int] = None,
+        seen_ids: Optional[set[str]] = None,
+        mark_done: bool = True,
     ) -> None:
         collected = 0
-        seen_ids: set[str] = set()
+        skipped_here = 0  # 本组命中数据库已有商品、被跳过的条数
+        skipped_img = 0  # 本组图片不合规（证书图 / 占位图 / 无图）、被跳过的条数
+        skipped_ds = 0  # 本组无数据手册、被跳过的条数
+        image_filter = str(task.config.get("imageFilter") or DEFAULT_IMAGE_FILTER)
+        # 数据手册过滤：默认开，但只对「站点本身提供该字段」的站点生效
+        # （华秋 / 云汉 无数据手册链接，若一并启用会把这两站全部跳过）
+        datasheet_filter = bool(task.config.get("datasheetFilter", True)) and bool(
+            getattr(site, "supports_datasheet", False)
+        )
+        # 去重集合：整个任务共享（同一商品在多个子类目 / 品牌下只采一次）
+        if seen_ids is None:
+            seen_ids = task.seen_ids
+        g = task.groups.get(group_name)
         target = min(per_count, SITE_TOTAL_LIMIT)
+        exhausted = True  # 站点是否已确定没有更多商品（出错时保持 False，不下调目标）
 
         # 一个分组可对应多个类目 ID（依次抓取，累计到 target 为止）
         id_list: list[Any] = list(catalog_ids) if catalog_ids else [None]
@@ -690,12 +994,16 @@ class TaskRunner:
                 )
                 try:
                     if catalog_ids:
-                        products, total = await site.category_page(catalog_id, page)
+                        if brand_id is not None:
+                            products, total = await site.category_page(catalog_id, page, brand_id)
+                        else:
+                            products, total = await site.category_page(catalog_id, page)
                     else:
                         products, total = await fetch_page(page)
                 except LcscError as exc:
                     task.errors += 1
                     task.log(f"[{group_name}] 第{page}页失败: {exc}")
+                    exhausted = False
                     break
                 if not products:
                     break
@@ -709,6 +1017,12 @@ class TaskRunner:
                     if not pid or pid in seen_ids:
                         continue
                     seen_ids.add(pid)
+                    # 数据库已有商品：列表页已知商品编号 / 型号时先跳过，省一次详情请求
+                    if task.existing and task.existing.matched(
+                        product.get("商品编号"), product.get("型号")
+                    ):
+                        skipped_here += 1
+                        continue
                     # 详情页（完整参数/编号/图片）
                     task.current = f"{group_name} · {product.get('型号') or pid}"
                     try:
@@ -719,28 +1033,74 @@ class TaskRunner:
                         task.errors += 1
                         product["参数错误"] = str(exc)[:200]
                         task.log(f"[{group_name}] 详情失败 {pid}: {exc}")
+                    # 详情页才拿到商品编号 / 型号的站点，此处再核对一次
+                    if task.existing and task.existing.matched(
+                        product.get("商品编号"), product.get("型号")
+                    ):
+                        skipped_here += 1
+                        continue
+                    # 图片过滤：对象是详情页补全后的图片链接（华秋等站点的列表行不带图，
+                    # 只在详情页才有，故统一在 enrich 之后判断，避免误杀）
+                    if not passes_image_filter(product, image_filter):
+                        skipped_img += 1
+                        continue
+                    # 数据手册过滤：无 PDF 链接的商品跳过（仅立创等提供该字段的站点）
+                    if datasheet_filter and not str(
+                        product.get("数据手册PDF链接") or ""
+                    ).strip().lower().startswith("http"):
+                        skipped_ds += 1
+                        continue
                     product.pop("_pid", None)
                     task.products.setdefault(group_name, []).append(product)
                     task._append(group_name, product)
                     collected += 1
                     task.collected += 1
                     task.detail_done += 1
-                    g = task.groups.get(group_name)
                     if g:
-                        g["collected"] = collected
+                        g["collected"] = g.get("collected", 0) + 1
                     task._notify()
                     if collected >= target:
                         break
                 # 单类目页数用尽
                 if total and page * max(1, len(products)) >= min(total, SITE_TOTAL_LIMIT):
-                    if catalog_id is None and collected < target:
-                        task.log(f"[{group_name}] 站点仅有 {total} 条，不足 {target} 条")
+                    if collected < target:
+                        msg = f"[{group_name}] 该类目共 {min(total, SITE_TOTAL_LIMIT)} 条"
+                        if skipped_here:
+                            msg += f"，其中 {skipped_here} 条数据库已有（已跳过）"
+                        if skipped_img:
+                            msg += f"，{skipped_img} 条图片不合规（已跳过）"
+                        if skipped_ds:
+                            msg += f"，{skipped_ds} 条无数据手册（已跳过）"
+                        msg += f"，实际采集 {collected} 条"
+                        task.log(msg)
                     break
                 page += 1
-        g = task.groups.get(group_name)
+        # 站点确实没有更多商品（非报错/取消）时，把虚高的目标下调到实际可得条数，
+        # 避免进度条永远跑不满、目标数虚高；被跳过（数据库已有 / 图片不合规 / 无数据手册）的条数同样从目标中扣除
+        task.skipped_existing += skipped_here
+        task.skipped_no_image += skipped_img
+        task.skipped_no_datasheet += skipped_ds
+        skipped_total = skipped_here + skipped_img + skipped_ds
         if g:
+            # 记录本组被跳过的条数，供前端区分「无在售商品」与「已全部存在」
+            g["skipped"] = g.get("skipped", 0) + skipped_total
+            if exhausted:
+                reduce = min(target - collected, g.get("target", 0))
+            else:
+                reduce = min(skipped_total, g.get("target", 0))
+            if reduce > 0:
+                g["target"] = g.get("target", 0) - reduce
+                task.total_products = max(0, task.total_products - reduce)
+        if mark_done and g:
             g["done"] = True
-        task.log(f"[{group_name}] 完成，采集 {collected} 条")
+        msg = f"[{group_name}] 采集 {collected} 条"
+        if skipped_here:
+            msg += f"，跳过数据库已有 {skipped_here} 条"
+        if skipped_img:
+            msg += f"，跳过图片不合规 {skipped_img} 条"
+        if skipped_ds:
+            msg += f"，跳过无数据手册 {skipped_ds} 条"
+        task.log(msg)
         task.current = ""
 
 
