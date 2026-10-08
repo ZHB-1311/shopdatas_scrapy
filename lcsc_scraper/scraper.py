@@ -81,7 +81,7 @@ class LcscSite:
     def __init__(self, concurrency: int = 6):
         self.client = LcscClient(concurrency=concurrency)
         self._cat_map: Optional[dict] = None  # catalogId -> catalogName（惰性构建）
-        self._brand_web: dict[str, str] = {}  # 品牌ID -> 厂商官网（惰性缓存）
+        self._brand_web: dict[str, dict] = {}  # 品牌ID -> currentBrand（官网/简介，惰性缓存）
         self._brand_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
@@ -179,6 +179,7 @@ class LcscSite:
             "型号": vo.get("productModel"),
             "品牌": vo.get("productGradePlateName"),
             "品牌网址": "",
+            "品牌简介": "",
             "品牌ID": vo.get("productGradePlateId"),
             "类目": cat_name or vo.get("productType"),
             "商品描述": vo.get("productName"),
@@ -227,7 +228,7 @@ class LcscSite:
         if brand.get("brandName"):
             product["品牌"] = brand["brandName"]
             product["品牌ID"] = brand.get("brandId")
-        # 品牌网址（厂商官网）：按 brandId 缓存，每个品牌仅请求一次
+        # 品牌网址（厂商官网）+ 品牌简介：按 brandId 缓存，每个品牌仅请求一次
         bid = product.get("品牌ID")
         if bid not in (None, ""):
             key = str(bid)
@@ -236,10 +237,12 @@ class LcscSite:
                     if key not in self._brand_web:
                         try:
                             info = await self.client.brand_detail(key)
-                            self._brand_web[key] = info.get("companyWebsite") or ""
                         except Exception:  # noqa: BLE001
-                            self._brand_web[key] = ""
-            product["品牌网址"] = self._brand_web.get(key, "")
+                            info = {}
+                        self._brand_web[key] = info or {}
+            info = self._brand_web.get(key) or {}
+            product["品牌网址"] = info.get("companyWebsite") or ""
+            product["品牌简介"] = info.get("companyContext") or ""
         # 商品参数：详情页 paramList 覆盖/补充列表页 paramLinkedMap
         for p in web.get("paramList") or []:
             name = p.get("parameterName")
