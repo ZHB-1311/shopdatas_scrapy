@@ -44,6 +44,8 @@
   .brand-list { flex: 1; max-height: 380px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start; }
   .brand-side { width: 220px; display: flex; flex-direction: column; gap: 8px; }
   .brand-side input { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
+  .brand-actions { display: flex; gap: 8px; }
+  .brand-actions .btn { flex: 1; padding: 6px; font-size: 13px; white-space: nowrap; }
   .selected-brands { font-size: 12px; color: var(--muted); max-height: 260px; overflow: auto; line-height: 1.8; }
 
   .btn { padding: 10px 28px; border-radius: 9px; border: none; font-size: 15px; cursor: pointer; font-weight: 600; }
@@ -152,7 +154,10 @@
         <div class="brand-list" id="brandList"><div class="empty"><span class="spin"></span> 正在加载品牌…</div></div>
         <div class="brand-side">
           <input id="brandSearch" placeholder="搜索品牌名" oninput="renderBrands()">
-          <button class="btn ghost" style="padding:6px;font-size:13px" onclick="clearBrands()">清空已选</button>
+          <div class="brand-actions">
+            <button class="btn ghost" id="brandSelectAllBtn" onclick="selectAllBrands()">全选</button>
+            <button class="btn ghost" onclick="clearBrands()">清空已选</button>
+          </div>
           <div class="selected-brands" id="selectedBrands"></div>
         </div>
       </div>
@@ -207,6 +212,22 @@
         留空则读取 <code>lcsc_scraper/db_config.json</code>（或环境变量 DB_HOST 等）；两者都没有时自动跳过该过滤，不影响采集。<br>
         采集到的「商品编号」命中<b>商品编号字段</b>，或「型号」命中<b>型号字段</b>（忽略大小写与空格）即视为已存在、直接跳过。（在 <code>db_config.json</code> 里把字段名写成空串 <code>""</code> 可关闭对应规则。）
         <label style="margin-left:8px"><input type="checkbox" id="skipExisting" checked> 启用「跳过已有商品」</label>
+      </div>
+    </details>
+
+    <details class="db-box" id="hqCookieBox">
+      <summary>华秋登录 Cookie（华秋采集必填）：列表接口现在要求登录态</summary>
+      <div class="db-fields">
+        <div class="field" style="flex:1">
+          <label>Cookie</label>
+          <input id="hqCookie" placeholder="从浏览器开发者工具复制 hqchip.com 请求头里的 Cookie 整串">
+        </div>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        获取方式：在已登录华秋的浏览器里按 F12 → Network → 刷新页面 → 点任一 <code>hqchip.com</code> 请求 →
+        Request Headers 里复制整条 <code>Cookie</code> 值，粘贴到上面。留空则读取
+        <code>lcsc_scraper/hqchip_config.json</code> 的 <code>cookie</code> 字段（或环境变量 <code>HQCHIP_COOKIE</code>）。
+        该 Cookie 等同于登录凭证，请勿提交到版本库。
       </div>
     </details>
   </div>
@@ -311,6 +332,7 @@ function switchSite(sid) {
   document.querySelectorAll('#siteTabs .tab').forEach(t => t.classList.toggle('active', t.dataset.site === sid));
   updateSiteHint();
   leafState.clear();
+  catGroups = [];              // 清掉上一站的类目，避免在新类目返回前被误提交
   selectedBrands.clear();
   document.getElementById('catGroups').innerHTML = '<div class="empty"><span class="spin"></span> 正在加载类目…</div>';
   document.getElementById('brandList').innerHTML = '<div class="empty"><span class="spin"></span> 正在加载品牌…</div>';
@@ -331,9 +353,11 @@ function switchMode(m) {
 }
 
 async function loadCatalog() {
-  const r = await fetch('/api/catalog?site=' + currentSite);
+  const site = currentSite;                 // 记住发起时的站点
+  const r = await fetch('/api/catalog?site=' + site);
   const d = await r.json();
-  catGroups = d.groups;
+  if (site !== currentSite) return;         // 迟到的响应：站点已切换，丢弃，避免灌入别站类目
+  catGroups = d.groups || [];
   renderCatalog();
   presetThree();
 }
@@ -367,9 +391,11 @@ function toggleGroup(gid, on) {
 }
 function toggleLeaf(id, on) {
   if (on) leafState.add(id); else leafState.delete(id);
-  document.getElementById('leaf' + id).classList.toggle('on', on);
+  const el = document.getElementById('leaf' + id);
+  if (el) el.classList.toggle('on', on);
 }
 function selectAll(on) {
+  leafState.clear();   // 先清空：避免残留其它站点/上一次的勾选
   catGroups.forEach(g => g.leaves.forEach(l => toggleLeaf(l.catalogId, on)));
   document.querySelectorAll('.cat-group input[type=checkbox]').forEach(c => c.checked = on);
 }
@@ -390,16 +416,43 @@ async function loadBrands() {
   renderBrands();
 }
 
-function renderBrands() {
+const BRAND_RENDER_LIMIT = 400;   // 一次最多渲染的品牌胶囊数（再多用搜索定位）
+const BRAND_CONFIRM_LIMIT = 40;   // 选中品牌超过这个数时，全选前先确认（探测规模 = 子类目数 × 品牌数）
+
+function filteredBrands() {
   const kw = document.getElementById('brandSearch').value.trim().toLowerCase();
+  return kw ? allBrands.filter(b => b.brandName.toLowerCase().includes(kw)) : allBrands;
+}
+
+function renderBrands() {
   const box = document.getElementById('brandList');
-  const list = allBrands.filter(b => !kw || b.brandName.toLowerCase().includes(kw));
-  box.innerHTML = list.slice(0, 400).map(b => {
+  const list = filteredBrands();
+  box.innerHTML = list.slice(0, BRAND_RENDER_LIMIT).map(b => {
     const on = selectedBrands.has(b.brandId);
     return `<label class="leaf ${on ? 'on' : ''}" onclick="toggleBrand(${b.brandId}, '${b.brandName.replace(/'/g, "\\'")}', this);return false;">
       ${b.brandName}${on ? ' ✓' : ''}</label>`;
-  }).join('') + (list.length === 0 ? '<div class="empty">无匹配品牌</div>' : '');
+  }).join('')
+    + (list.length === 0 ? '<div class="empty">无匹配品牌</div>' : '')
+    + (list.length > BRAND_RENDER_LIMIT
+        ? `<div class="empty">共 ${list.length} 个，仅显示前 ${BRAND_RENDER_LIMIT} 个；「全选」会选中全部 ${list.length} 个</div>`
+        : '');
+  const btn = document.getElementById('brandSelectAllBtn');
+  if (btn) {
+    btn.textContent = list.length === allBrands.length
+      ? `全选 (${list.length})` : `全选筛选 (${list.length})`;
+  }
   renderSelectedBrands();
+}
+
+function selectAllBrands() {
+  const list = filteredBrands();
+  if (!list.length) return;
+  const total = new Set([...selectedBrands.keys(), ...list.map(b => b.brandId)]).size;
+  if (total > BRAND_CONFIRM_LIMIT && !confirm(
+      `将选中 ${total} 个品牌。\n\n采集规模 = 子类目数 × 品牌数（立创三大类共 89 个子类目），` +
+      `探测阶段每个品牌都要对每个子类目发一次请求，规模很大会跑到几小时。\n\n确定继续？`)) return;
+  list.forEach(b => selectedBrands.set(b.brandId, b.brandName));
+  renderBrands();
 }
 function toggleBrand(id, name, el) {
   if (selectedBrands.has(id)) selectedBrands.delete(id); else selectedBrands.set(id, name);
@@ -407,9 +460,13 @@ function toggleBrand(id, name, el) {
 }
 function clearBrands() { selectedBrands.clear(); renderBrands(); }
 function renderSelectedBrands() {
+  const names = [...selectedBrands.values()];
+  const MAX = 30;   // 选得多时只列前 30 个，避免右侧被刷屏
+  const text = names.length > MAX
+    ? names.slice(0, MAX).join('、') + ` …（等 ${names.length} 个）`
+    : names.join('、');
   document.getElementById('selectedBrands').innerHTML =
-    `已选 <b>${selectedBrands.size}</b> 个品牌：<br>` +
-    [...selectedBrands.values()].join('、');
+    `已选 <b>${selectedBrands.size}</b> 个品牌：<br>` + text;
 }
 
 async function startTask() {
@@ -419,6 +476,7 @@ async function startTask() {
   const body = { site: currentSite, mode, perCount, concurrency, groupParallel, catalogs: [], brands: [] };
   body.imageFilter = document.getElementById('imageFilter').value;
   body.datasheetFilter = document.getElementById('datasheetFilter').checked;
+  body.cookie = document.getElementById('hqCookie').value.trim();
 
   // 数据库去重：仅提交非空字段（覆盖 db_config.json / 环境变量）
   body.skipExisting = document.getElementById('skipExisting').checked;

@@ -31,6 +31,7 @@ class TaskCreate(BaseModel):
     # 图片过滤：off 不过滤 / placeholder（默认）跳过非商品图 / require 只保留有商品实拍图
     imageFilter: str = Field(default="placeholder", pattern="^(off|placeholder|require)$")
     datasheetFilter: bool = True  # 跳过无数据手册（PDF 链接）的商品，仅对提供该字段的站点生效
+    cookie: str = ""            # 华秋登录 Cookie（列表接口要求登录态），留空则读 hqchip_config.json / HQCHIP_COOKIE
 
 
 @app.on_event("startup")

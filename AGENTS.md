@@ -81,9 +81,24 @@
 
 ### Excel 导出结构（2026-10 起）
 
-- 共 **22 列**：`商品编号 / 型号 / 品牌 / 品牌网址 / 品牌简介 / 类目 / 商品描述 / 封装 / 库存 / 近期销量 /
-  最小起订 / 包装方式 / 包装规格 / 单价 / 价格梯度 / 毛重 / 图片链接 / 数据手册PDF链接 /
+- 共 **24 列**：`商品编号 / 型号 / 品牌 / 公司名称 / 公司logo / 品牌网址 / 品牌简介 / 类目 / 商品描述 / 封装 /
+  库存 / 近期销量 / 最小起订 / 包装方式 / 包装规格 / 单价 / 价格梯度 / 毛重 / 图片链接 / 数据手册PDF链接 /
   关联(替代产品)型号 / 详情链接 / 简介/备注 / 参数`。
+- **文本清洗**（2026-10）：站点给的简介/描述常带 HTML 实体（如 `&nbsp;&nbsp;C&K成立于…`），
+  统一走 `company.clean_text()`（反转义实体 ≤3 层、去标签、归一空白、`&nbsp;`→空格）。
+  来源处已清洗：立创 `品牌简介/品牌网址/商品描述/简介备注`、华秋 `品牌简介/商品描述/简介备注`、
+  云汉 `简介/备注`；`excel_export._cell_value` 再对所有文本列兜底清洗一次。
+- **`公司名称`（2026-10 新增）位于 `品牌` 之后**：由 `品牌简介` 经 `company.extract_company_name()`
+  分三层提取——① 前缀法（取起始到第一个触发词/标点的片段，如 `泰科电子（TE Connectivity）`）；
+  ② 实体法（全文找第一个以公司后缀结尾的实体，后缀按特异性排序，处理简介不以公司名开头的情况，
+  如 `深圳市长江连接器有限公司`）；③ 回退到品牌名（如 `TOPLY(拓林)`）。
+  导出时按列即时计算（`excel_export._cell_value`，传入 `品牌` 作回退）。
+- **`公司logo`（2026-10 新增）紧跟 `公司名称` 之后**：品牌 logo 图片 URL（每品牌一张，与品牌元信息同源）。
+  - 立创：`client.brand_meta()` 返回的 `currentBrand.logoUrl`（实测 `alimg.szlcsc.com/upload/public/brand/logo/…`
+    图床；少数品牌无 logo 则留空）。
+  - 华秋：品牌页 `/gongsi/{公司ID}.html` 的 `div.ibox > img[src]`（协议相对地址 `//file.huaqiu.com/…`，
+    解析时补 `https:`）；在 `HqChipClient.brand_meta()` 里与 `website/intro` 一并缓存。
+  - 云汉：无品牌元信息，留空。
 - **`引脚图链接` / `焊盘链接` 已彻底移除**：不再导出，也**不再抓取**（`LcscSite.enrich()` 里取消调用，
   每个商品少一次 `lceda.cn` 请求；`LcscClient.pinpad_urls()` 方法保留以便随时接回）。
 - **参数合并为单列 `参数`**，格式 `名称:值；名称:值；…`（`excel_export.format_params()`）。
@@ -100,6 +115,56 @@
 - 不要把密码写进本文件或任何会被提交的文件。
 
 ## 反爬与品牌模式注意事项
+
+### 华秋（hqchip）类目与登录态（2026-10）
+
+- **类目菜单源改为 `https://www.hqchip.com/app`**：原 `/app/cn` 已变成登录壳页（36KB，无
+  `second-category-title`、无 `/app/` 链接），导致 `catalog_groups()` 返回 `[]`、前端类目勾选区全空。
+  首页/`/app` 仍内嵌完整菜单。**分组与叶子链接由绝对路径 `https://www.hqchip.com/app/{id}` 改成了
+  相对路径 `href="/app/{id}"`**，`hqchip.py` 两条正则已改为可选前缀
+  `(?:https://www\.hqchip\.com)?/app/(\d+)`。三大目标分组（连接器 1512 / 开关及按键 848 /
+  线缆及配套 1356）ID 未变。
+- **列表接口现要求登录态**：`GET /category/detailInfo.html` 无 Cookie 时返回
+  `retCode 105000 / retMsg「请先登录」`（自 2026-10 起，此前可匿名访问）。站点自发的访客 Cookie
+  （`acw_tc` / `cdn_sec_tc` / `visitor`）不够，搜索页也会 302 到 `users/login.html`。
+- **解决方式**：给 `HqChipClient` 注入浏览器登录 Cookie。优先级：任务配置 `cookie` >
+  `lcsc_scraper/hqchip_config.json` 的 `cookie` 字段 > 环境变量 `HQCHIP_COOKIE`。
+  前端「华秋登录 Cookie」文本域填入（`index.html`），经 `TaskCreate.cookie` →
+  `create_site(..., config)` → `HqSite(cookie=...)` → `HqChipClient(cookie=...)` 注入 `Cookie` 头。
+- 取 Cookie：已登录的浏览器 F12 → Network → 任一 `hqchip.com` 请求 → Request Headers 里的 `Cookie` 整串。
+  Cookie 等同登录凭证，`/lcsc_scraper` 已被 `.gitignore` 忽略，不要提交。
+- 未配置 Cookie 时客户端会 warning；列表接口命中 105000 时抛出带指引的 `LcscError`。
+
+### 华秋（hqchip）字段映射（2026-10）
+
+- 华秋数据分两处取：**列表接口**（`/category/detailInfo.html`，需登录）给骨架字段；
+  **详情页**（`item.hqchip.com/{stockId}.html`，公开）给完整字段；**品牌页**给品牌网址/简介。
+- 详情页解析（`HqChipClient.product_detail`）：
+  - 价格梯度：`<h2 class="price-list">` 内第一个 `<table>` 的「数量 / 国内含税」行 →
+    `1+: ¥2.21650; 30+: ¥2.13900; …`（与立创同格式）。注意排除「其他供应商价格」表。
+  - **单价 = 价格梯度里「数量档最大」那档的价格**（如 `1000+` 档，即最低价，`price_bulk`）——
+    与立创口径一致（`LcscSite._flatten` 的 `max_tier`）。华秋列表接口的 `shop_price` 常为 `0`
+    （实测），故以详情页阶梯价覆盖。
+  - 包装：`<span class="s3">「袋装(BAG)/10」</span>` → 包装方式=袋装、包装规格=10。
+  - 商品描述：`<span class="text goodsDesc">…`。
+  - 品牌公司ID：`<a class="brandName" href="/gongsi/{id}.html">`。
+  - 图片：`goodsImg` 数组；部分商品确实无图（页面用 `nob.png` 占位），此时图片为空。
+- 品牌网址 / 品牌简介（`HqChipClient.brand_meta`）：`GET /gongsi/{公司ID}.html` 的
+  `.brand_url a[href]`（官网）与 `.introduce_text`（简介），按公司ID 缓存 + 并发锁。
+- 类目：列表接口只给叶子名，`HqSite` 用 `_leaf_top`（叶子ID→顶级分组）拼成「大类>子类」，
+  如 `开关及按键>滑动开关`。
+- **字段重映射（按用户要求）**：`商品描述` 列 = 型号；站点原「商品描述」（详情页 goodsDesc）
+  放入 `简介/备注` 列；`包装方式/包装规格/价格梯度/品牌网址/品牌简介` 由详情页/品牌页补全。
+
+### 采集性能（2026-10）
+
+- **详情请求并发**：`_scrape_group` 按 `min(单请求并发数, 10)` 分批 `asyncio.gather` 抓详情，
+  再按列表顺序逐条消费（不改变「销量前 N 条」语义）。实测详情单条 ~1.9s，10 并发 ~2.0s。
+- **列表阶段预过滤**：立创列表行已带最终「图片链接」「数据手册PDF链接」（`enrich` 不改写这两项），
+  故 `LcscSite.list_image_ready / list_datasheet_ready = True`，在发详情请求前先过滤，
+  省掉被拒商品的那次详情请求（华秋/云汉为 False，因图只在详情页）。实测 18 组任务 285s → 61s。
+
+### 立创品牌页反爬
 
 - 立创品牌页 `list.szlcsc.com/brand/{id}.html` 目前被**腾讯验证码（TCaptcha）拦截**，返回的不是
   `__NEXT_DATA__` 而是验证码脚本，因此 `brand_page_info` 会得到空结果。

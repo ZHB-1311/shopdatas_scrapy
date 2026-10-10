@@ -23,6 +23,7 @@ from typing import Optional
 import httpx
 
 from .client import USER_AGENT, LcscError
+from .company import clean_text
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +208,7 @@ class IcKeyClient:
             "毛重": "",
             "图片链接": img,
             "详情链接": f"https://www.ickey.cn/detail/{sku}/{sno}.html" if sku and sno else "",
-            "简介/备注": p.get("lifecycle") or "",
+            "简介/备注": clean_text(p.get("lifecycle")),
             "_pid": sku,
         }
 

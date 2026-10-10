@@ -11,14 +11,18 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .company import clean_text, extract_company_name
 from .scraper import DATA_DIR, ScrapeTask
 
 BASE_COLUMNS = [
-    "商品编号", "型号", "品牌", "品牌网址", "品牌简介", "类目", "商品描述", "封装",
+    "商品编号", "型号", "品牌", "公司名称", "公司logo", "品牌网址", "品牌简介", "类目", "商品描述", "封装",
     "库存", "近期销量", "最小起订", "包装方式", "包装规格", "单价", "价格梯度",
     "毛重", "图片链接", "数据手册PDF链接", "关联(替代产品)型号", "详情链接", "简介/备注",
     "参数",
 ]
+
+COMPANY_COLUMN = "公司名称"
+COMPANY_LOGO_COLUMN = "公司logo"
 
 PARAM_PREFIX = "参数:"
 PARAM_COLUMN = "参数"
@@ -87,12 +91,22 @@ def _auto_width(ws, max_width: int = 46) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
+def _cell_value(product: dict, column: str):
+    if column == PARAM_COLUMN:
+        return format_params(product)
+    if column == COMPANY_COLUMN:
+        return extract_company_name(product.get("品牌简介"), product.get("品牌"))
+    value = product.get(column)
+    # 出口兜底：文本字段统一反转义 HTML 实体 / 去标签（历史数据或未清洗的站点）
+    return clean_text(value) if isinstance(value, str) else value
+
+
 def _write_category_sheet(ws, products: list[dict]) -> None:
     columns = BASE_COLUMNS
     ws.append(columns)
     _style_header(ws)
     for p in products:
-        ws.append([format_params(p) if c == PARAM_COLUMN else p.get(c) for c in columns])
+        ws.append([_cell_value(p, c) for c in columns])
     _auto_width(ws)
 
 

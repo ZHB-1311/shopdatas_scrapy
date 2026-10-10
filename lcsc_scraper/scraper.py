@@ -20,6 +20,7 @@ from .client import (
     LcscError,
 )
 from .db import ExistingIndex, fetch_existing_index, load_db_config
+from .company import clean_text
 from .hqchip import HqChipClient
 from .ickey import IcKeyClient
 
@@ -34,11 +35,12 @@ IMAGE_FILTER_REQUIRE = "require"  # 跳过「非商品图」与「无图」，�
 DEFAULT_IMAGE_FILTER = IMAGE_FILTER_PLACEHOLDER
 
 # 「非商品实拍图」的 URL 特征。实测（data/ 8543 条样本）占 11%：
-#   - 立创：/upload/public/brand/product/certificate/…（品牌证书图，860 条仅 16 张不同图，
-#     同一品牌下所有商品共用，列表页缩略图因此全部相同）
+#   - 立创：https://alimg.szlcsc.com/upload/public/brand/product/certificate/…（品牌证书图，
+#     860 条仅 16 张不同图，同一品牌下所有商品共用，列表页缩略图因此全部相同；
+#     匹配串用 `brand/product/certificate`，不带首尾斜杠，兼容末尾无斜杠 / 其他分隔的写法）
 #   - 云汉：static-ickey/assets/…/img/pic/default_list_logo.jpg（默认占位图，89 条共用 1 张）
 NON_PRODUCT_IMAGE_MARKS = (
-    "/brand/product/certificate/",
+    "brand/product/certificate",
     "default_list_logo",
     "/img/pic/default",
     "placeholder",
@@ -161,6 +163,10 @@ class LcscSite:
     label = "立创商城"
     supports_brand = True
     supports_datasheet = True   # 列表页 fileTypeVOList 能给到数据手册 PDF 链接
+    # 列表行已带最终「图片链接」「数据手册PDF链接」（enrich 不改写这两项），
+    # 故可在列表阶段先做图片/数据手册过滤，省掉被拒商品的那次详情请求。
+    list_image_ready = True
+    list_datasheet_ready = True
 
     def __init__(self, concurrency: int = 6):
         self.client = LcscClient(concurrency=concurrency)
@@ -169,6 +175,7 @@ class LcscSite:
         self._brand_meta: dict[str, Optional[dict]] = {}  # 品牌ID -> currentBrand 官网/简介（惰性缓存）
         self._brand_lock = asyncio.Lock()
         self._brand_meta_lock = asyncio.Lock()
+        self._cat_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -176,19 +183,21 @@ class LcscSite:
     async def _catalog_name(self, catalog_id) -> str:
         """类目 id -> 名称（用整棵类目树缓存，避免逐商品查父类）。"""
         if self._cat_map is None:
-            tree = await self.client.catalog_tree()
-            mapping: dict = {}
+            async with self._cat_lock:
+                if self._cat_map is None:
+                    tree = await self.client.catalog_tree()
+                    mapping: dict = {}
 
-            def walk(node: dict) -> None:
-                cid = node.get("catalogId")
-                if cid is not None:
-                    mapping[cid] = node.get("catalogName")
-                for son in node.get("sonCatalogList") or []:
-                    walk(son)
+                    def walk(node: dict) -> None:
+                        cid = node.get("catalogId")
+                        if cid is not None:
+                            mapping[cid] = node.get("catalogName")
+                        for son in node.get("sonCatalogList") or []:
+                            walk(son)
 
-            for top in tree.values():
-                walk(top)
-            self._cat_map = mapping
+                    for top in tree.values():
+                        walk(top)
+                    self._cat_map = mapping
         return self._cat_map.get(catalog_id, "")
 
     async def catalog_groups(self) -> list[dict]:
@@ -268,9 +277,10 @@ class LcscSite:
             "品牌": vo.get("productGradePlateName"),
             "品牌网址": "",
             "品牌简介": "",
+            "公司logo": "",
             "品牌ID": vo.get("productGradePlateId"),
             "类目": cat_name or vo.get("productType"),
-            "商品描述": vo.get("productName"),
+            "商品描述": clean_text(vo.get("productName")),
             "封装": vo.get("encapsulationModel"),
             "库存": record.get("totalStockNumber")
             if record.get("totalStockNumber") is not None
@@ -288,7 +298,7 @@ class LcscSite:
             "详情链接": f"https://item.szlcsc.com/{vo.get('productId')}.html"
             if vo.get("productId")
             else "",
-            "简介/备注": vo.get("remark"),
+            "简介/备注": clean_text(vo.get("remark")),
         }
         # 商品参数（列表页 paramLinkedMap），详情页 paramList 会在 enrich 中覆盖/补充
         for k, v in (record.get("paramLinkedMap") or {}).items():
@@ -322,8 +332,12 @@ class LcscSite:
         bid = product.get("品牌ID")
         if bid not in (None, ""):
             current = await self.brand_meta(bid) or {}
-            product["品牌网址"] = current.get("companyWebsite") or ""
-            product["品牌简介"] = current.get("companyContext") or ""
+            product["品牌网址"] = clean_text(current.get("companyWebsite"))
+            product["品牌简介"] = clean_text(current.get("companyContext"))
+            # 公司logo：同源字段 currentBrand.logoUrl（品牌 logo 图，实测多为 alimg.szlcsc.com 图床）
+            logo = clean_text(current.get("logoUrl"))
+            if logo:
+                product["公司logo"] = logo
         # 商品参数：详情页 paramList 覆盖/补充列表页 paramLinkedMap
         for p in web.get("paramList") or []:
             name = p.get("parameterName")
@@ -459,21 +473,31 @@ class HqSite:
     supports_brand = False
     supports_datasheet = False  # 站点/解析均无数据手册链接（实测 0%）
 
-    def __init__(self, concurrency: int = 6):
-        self.client = HqChipClient(concurrency=concurrency)
+    def __init__(self, concurrency: int = 6, cookie: Optional[str] = None):
+        self.client = HqChipClient(concurrency=concurrency, cookie=cookie)
+        self._leaf_top: dict[str, str] = {}  # 叶子类目ID -> 顶级分组名（用于「大类>子类」）
 
     async def aclose(self) -> None:
         await self.client.aclose()
 
     async def catalog_groups(self) -> list[dict]:
-        return await self.client.catalog_groups()
+        groups = await self.client.catalog_groups()
+        # 记录每个叶子所属的顶级分组，供类目显示为「开关及按键>滑动开关」
+        for g in groups:
+            for leaf in g.get("leaves") or []:
+                self._leaf_top[str(leaf["catalogId"])] = g.get("catalogName") or ""
+        return groups
 
     async def category_page(self, catalog_id, page: int) -> tuple[list[dict], int]:
         products, total = await self.client.category_page(int(catalog_id), page)
+        top = self._leaf_top.get(str(catalog_id))
         for p in products:
             m = _HQ_ITEM_ID_RE.search(p.get("详情链接") or "")
             if m:
                 p["_pid"] = m.group(1)
+            leaf = p.get("类目") or ""
+            if top and leaf:
+                p["类目"] = f"{top}>{leaf}"
         return products, total
 
     async def enrich(self, product: dict) -> dict:
@@ -484,6 +508,32 @@ class HqSite:
             product["商品编号"] = detail["code"]
         if detail.get("images"):
             product["图片链接"] = detail["images"][0]
+        # 价格梯度：「1+: ¥2.21650; 30+: ¥2.13900; …」
+        if detail.get("price_ladder"):
+            product["价格梯度"] = detail["price_ladder"]
+        # 单价取价格梯度里「数量档最大」那档（如 1000+ 档，最低价），与立创口径一致；
+        # 华秋列表接口的 shop_price 常为 0（实测），故以详情页阶梯价兜底。
+        if detail.get("price_bulk") is not None:
+            product["单价"] = detail["price_bulk"]
+        # 包装：「袋装(BAG)/10」→ 方式=袋装、规格=10
+        package = detail.get("package") or ""
+        if package:
+            name_part, _, spec = package.partition("/")
+            product["包装方式"] = name_part.split("(", 1)[0].strip()
+            product["包装规格"] = spec.strip()
+        # 商品描述以详情页为准（列表页可能缺），放入「简介/备注」
+        if detail.get("goods_desc"):
+            product["简介/备注"] = clean_text(detail["goods_desc"])
+        # 品牌网址 / 品牌简介 / 公司logo：品牌页（/gongsi/{公司ID}.html），按公司ID 缓存
+        company_id = detail.get("brand_company_id")
+        if company_id:
+            meta = await self.client.brand_meta(company_id)
+            if meta.get("website"):
+                product["品牌网址"] = clean_text(meta["website"])
+            if meta.get("intro"):
+                product["品牌简介"] = clean_text(meta["intro"])
+            if meta.get("logo"):
+                product["公司logo"] = clean_text(meta["logo"])
         return product
 
     async def brands(self) -> dict[str, list[dict]]:
@@ -539,10 +589,12 @@ SITES: dict[str, dict] = {
 }
 
 
-def create_site(site_id: str, concurrency: int):
+def create_site(site_id: str, concurrency: int, config: Optional[dict] = None):
     entry = SITES.get(site_id)
     if not entry:
         raise LcscError(f"未知站点: {site_id}")
+    if site_id == "hqchip":
+        return entry["cls"](concurrency=concurrency, cookie=(config or {}).get("cookie") or None)
     return entry["cls"](concurrency=concurrency)
 
 
@@ -737,7 +789,7 @@ class TaskRunner:
         task.status = "running"
         task._open_jsonl()
         await self._load_existing_index(task)
-        site = create_site(task.site, int(task.config.get("concurrency", 6)))
+        site = create_site(task.site, int(task.config.get("concurrency", 6)), task.config)
         try:
             if task.mode == "category":
                 await self._run_category(task, site)
@@ -802,10 +854,30 @@ class TaskRunner:
 
     async def _run_category(self, task: ScrapeTask, site) -> None:
         groups = await site.catalog_groups()
+        selected = task.config.get("catalogs") or []
+        # 校验所选类目确实属于当前站点：防止「站点已切换但勾选仍是别站」把别站 catId
+        # 拿去查询（会退化成数字组名、全部 0 条）。仅在成功取到类目树时校验，
+        # 树为空（站点接口异常）时不误杀，保持旧行为。
+        if groups and selected:
+            valid = {str(g["catalogId"]) for g in groups}
+            for g in groups:
+                valid.update(str(l["catalogId"]) for l in g.get("leaves") or [])
+            kept = [c for c in selected if str(c.get("catalogId")) in valid]
+            dropped = [c for c in selected if str(c.get("catalogId")) not in valid]
+            if dropped:
+                names = "、".join(
+                    str(c.get("catalogName") or c.get("catalogId")) for c in dropped[:10]
+                )
+                task.log(
+                    f"忽略 {len(dropped)} 个不属于本站点({task.site})的类目：{names}"
+                    + ("…" if len(dropped) > 10 else "")
+                )
+            selected = kept
+            if not selected:
+                task.log("所选类目均不属于当前站点，任务结束")
+                return
         # 展开成叶子，并按「展示分组」聚合（与品牌模式共用 _expand_leaves）
-        leaves: list[tuple[str, list[str]]] = _expand_leaves(
-            groups, task.config.get("catalogs") or []
-        )
+        leaves: list[tuple[str, list[str]]] = _expand_leaves(groups, selected)
 
         per_count = int(task.config.get("perCount", 2))
         task.total_products = per_count * len(leaves)
@@ -975,6 +1047,9 @@ class TaskRunner:
             seen_ids = task.seen_ids
         g = task.groups.get(group_name)
         target = min(per_count, SITE_TOTAL_LIMIT)
+        # 详情页并发批次大小：详情请求是耗时大头（实测立创单条 ~1.9s，10 条并发 ~2.0s），
+        # 故按客户端并发额度成批并发抓取，而不是逐条 await。上限 10，避免批次过大。
+        enrich_batch = max(1, min(int(task.config.get("concurrency", 6)), 10))
         exhausted = True  # 站点是否已确定没有更多商品（出错时保持 False，不下调目标）
 
         # 一个分组可对应多个类目 ID（依次抓取，累计到 target 为止）
@@ -1007,8 +1082,14 @@ class TaskRunner:
                     break
                 if not products:
                     break
+                # 阶段1：列表页即可判定的便宜去重（不发详情请求），收集候选
+                # 过滤会淘汰一部分候选（如「只保留商品实拍图」无图约 44%），多取一些候选：
+                # 上限 4×剩余目标，既避免为凑够条数把整页都拉详情，也避免多采。
+                need = max(1, target - collected)
+                cap = max(need * 4, enrich_batch)
+                candidates: list[tuple[str, dict]] = []
                 for product in products:
-                    if collected >= target:
+                    if len(candidates) >= cap:
                         break
                     task._check_cancel()
                     pid = str(
@@ -1023,44 +1104,70 @@ class TaskRunner:
                     ):
                         skipped_here += 1
                         continue
-                    # 详情页（完整参数/编号/图片）
-                    task.current = f"{group_name} · {product.get('型号') or pid}"
-                    try:
-                        product = await site.enrich(product)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        task.errors += 1
-                        product["参数错误"] = str(exc)[:200]
-                        task.log(f"[{group_name}] 详情失败 {pid}: {exc}")
-                    # 详情页才拿到商品编号 / 型号的站点，此处再核对一次
-                    if task.existing and task.existing.matched(
-                        product.get("商品编号"), product.get("型号")
+                    # 列表行已带最终图片 / 数据手册的站点（立创），先在此过滤，省一次详情请求
+                    if getattr(site, "list_image_ready", False) and not passes_image_filter(
+                        product, image_filter
                     ):
-                        skipped_here += 1
-                        continue
-                    # 图片过滤：对象是详情页补全后的图片链接（华秋等站点的列表行不带图，
-                    # 只在详情页才有，故统一在 enrich 之后判断，避免误杀）
-                    if not passes_image_filter(product, image_filter):
                         skipped_img += 1
                         continue
-                    # 数据手册过滤：无 PDF 链接的商品跳过（仅立创等提供该字段的站点）
-                    if datasheet_filter and not str(
-                        product.get("数据手册PDF链接") or ""
-                    ).strip().lower().startswith("http"):
+                    if (
+                        datasheet_filter
+                        and getattr(site, "list_datasheet_ready", False)
+                        and not str(product.get("数据手册PDF链接") or "")
+                        .strip()
+                        .lower()
+                        .startswith("http")
+                    ):
                         skipped_ds += 1
                         continue
-                    product.pop("_pid", None)
-                    task.products.setdefault(group_name, []).append(product)
-                    task._append(group_name, product)
-                    collected += 1
-                    task.collected += 1
-                    task.detail_done += 1
-                    if g:
-                        g["collected"] = g.get("collected", 0) + 1
-                    task._notify()
+                    candidates.append((pid, product))
+                # 阶段2：详情页并发抓取（由客户端信号量限流），再按原顺序逐条消费
+                for start in range(0, len(candidates), enrich_batch):
                     if collected >= target:
                         break
+                    chunk = candidates[start : start + enrich_batch]
+                    task.current = f"{group_name} · 详情并发 {len(chunk)} 条"
+                    results = await asyncio.gather(
+                        *(site.enrich(p) for _pid, p in chunk), return_exceptions=True
+                    )
+                    for (pid, product), result in zip(chunk, results):
+                        if collected >= target:
+                            break
+                        task._check_cancel()
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        if isinstance(result, Exception):
+                            task.errors += 1
+                            product["参数错误"] = str(result)[:200]
+                            task.log(f"[{group_name}] 详情失败 {pid}: {result}")
+                        else:
+                            product = result
+                        # 详情页才拿到商品编号 / 型号的站点，此处再核对一次
+                        if task.existing and task.existing.matched(
+                            product.get("商品编号"), product.get("型号")
+                        ):
+                            skipped_here += 1
+                            continue
+                        # 图片过滤：对象是详情页补全后的图片链接（华秋等站点的列表行不带图，
+                        # 只在详情页才有，故统一在 enrich 之后判断，避免误杀）
+                        if not passes_image_filter(product, image_filter):
+                            skipped_img += 1
+                            continue
+                        # 数据手册过滤：无 PDF 链接的商品跳过（仅立创等提供该字段的站点）
+                        if datasheet_filter and not str(
+                            product.get("数据手册PDF链接") or ""
+                        ).strip().lower().startswith("http"):
+                            skipped_ds += 1
+                            continue
+                        product.pop("_pid", None)
+                        task.products.setdefault(group_name, []).append(product)
+                        task._append(group_name, product)
+                        collected += 1
+                        task.collected += 1
+                        task.detail_done += 1
+                        if g:
+                            g["collected"] = g.get("collected", 0) + 1
+                        task._notify()
                 # 单类目页数用尽
                 if total and page * max(1, len(products)) >= min(total, SITE_TOTAL_LIMIT):
                     if collected < target:
